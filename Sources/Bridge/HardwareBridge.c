@@ -214,6 +214,8 @@ struct XSBridgeContext {
     bool s0ixCacheValid;
     bool cachedPluggedIn;
     bool cachedFullyCharged;
+    bool cachedActivelyCharging;
+    uint64_t lastS0ixRefreshNs;
     uint32_t cachedSleepCount;
     uint32_t cachedLastSleepType;
     uint32_t cachedLastCC7Pct;
@@ -1258,10 +1260,15 @@ static void xs_sample_power_s0ix(
         bool hasSleepProp = xs_reg_get_int64(ctx->s0ixService, CFSTR("Sleep count"), &liveSleepCount);
         uint32_t curSleepCount = (hasSleepProp && liveSleepCount > 0) ? (uint32_t)liveSleepCount : 0;
 
+        bool curActivelyCharging = pwr->isPluggedIn && (pwr->batteryWatts > 0.05);
+        bool s0ixPeriodicDue = nowMonoNs <= ctx->lastS0ixRefreshNs ||
+                               (nowMonoNs - ctx->lastS0ixRefreshNs) >= 10000000000ULL;
         bool needRefresh = !ctx->s0ixCacheValid ||
                            curSleepCount != ctx->cachedSleepCount ||
                            pwr->isPluggedIn != ctx->cachedPluggedIn ||
-                           pwr->isFullyCharged != ctx->cachedFullyCharged;
+                           pwr->isFullyCharged != ctx->cachedFullyCharged ||
+                           curActivelyCharging != ctx->cachedActivelyCharging ||
+                           s0ixPeriodicDue;
 
         if (needRefresh) {
             CFMutableDictionaryRef s0ixProps = NULL;
@@ -1270,6 +1277,8 @@ static void xs_sample_power_s0ix(
                 ctx->s0ixCacheValid = true;
                 ctx->cachedPluggedIn = pwr->isPluggedIn;
                 ctx->cachedFullyCharged = pwr->isFullyCharged;
+                ctx->cachedActivelyCharging = curActivelyCharging;
+                ctx->lastS0ixRefreshNs = nowMonoNs;
 
                 int64_t sleepCount = xs_dict_int64_or(s0ixProps, CFSTR("Sleep count"), 0);
                 int64_t lastSleepType = xs_dict_int64_or(s0ixProps, CFSTR("Last sleep type"), 0);
@@ -2250,6 +2259,7 @@ void xs_bridge_reset_baselines(XSBridgeContext *ctx) {
     ctx->gpuFreqState.freqProbed = false;
     ctx->gpuFreqState.supportsGpuFreq = false;
     ctx->s0ixCacheValid = false;
+    ctx->lastS0ixRefreshNs = 0;
     ctx->powerSampleCount = 0;
     ctx->lastPowerSampleNs = 0;
     ctx->hasBattRegCache = false;

@@ -138,8 +138,7 @@ struct XSBridgeContext {
     io_service_t s0ixService;
     io_registry_entry_t rootEntry;
     CFDictionaryRef refreshGpuFreqDict;
-    bool s0ixFreqProbed;
-    bool s0ixSupportsGpuFreq;
+    XSGpuFreqProbeState gpuFreqState;
 
     /* Cached S0ixStandby snapshot (refreshed on sleepCount / AC / full-charge change or reset) */
     bool s0ixCacheValid;
@@ -626,6 +625,93 @@ static void xs_sample_cpu_temps(XSBridgeContext *ctx, XSCpuMetrics *cpu) {
     cpu->hasTemp = anyRead;
 }
 
+static bool xs_iokit_read_s0ix_int(void *userCtx, const char *key, int64_t *outVal) {
+    XSBridgeContext *ctx = (XSBridgeContext *)userCtx;
+    if (!ctx || ctx->s0ixService == IO_OBJECT_NULL || !key) return false;
+    if (strcmp(key, "GPU Current Freq MHz") == 0) {
+        return xs_reg_get_int64(ctx->s0ixService, CFSTR("GPU Current Freq MHz"), outVal);
+    }
+    if (strcmp(key, "GPU Requested Freq MHz") == 0) {
+        return xs_reg_get_int64(ctx->s0ixService, CFSTR("GPU Requested Freq MHz"), outVal);
+    }
+    CFStringRef cfKey = CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingUTF8);
+    if (!cfKey) return false;
+    bool ok = xs_reg_get_int64(ctx->s0ixService, cfKey, outVal);
+    CFRelease(cfKey);
+    return ok;
+}
+
+static bool xs_iokit_trigger_s0ix_refresh(void *userCtx) {
+    XSBridgeContext *ctx = (XSBridgeContext *)userCtx;
+    if (!ctx || ctx->s0ixService == IO_OBJECT_NULL || !ctx->refreshGpuFreqDict) return false;
+    return IORegistryEntrySetCFProperties(ctx->s0ixService, ctx->refreshGpuFreqDict) == KERN_SUCCESS;
+}
+
+void xs_step_s0ix_gpu_freq(
+    XSGpuFreqProbeState *state,
+    double gpuUsagePct,
+    XSGpuReadRegIntFn readInt,
+    XSGpuTriggerRefreshFn triggerRefresh,
+    void *userCtx,
+    XSGpuMetrics *gpu)
+{
+    if (!state || !readInt || !gpu) return;
+
+    bool refreshedThisTick = false;
+
+    if (!state->freqProbed) {
+        int64_t passiveMHz = 0;
+        if (readInt(userCtx, "GPU Current Freq MHz", &passiveMHz)) {
+            state->freqProbed = true;
+            state->supportsGpuFreq = true;
+        } else if (gpuUsagePct >= 0.5) {
+            state->refreshCallCount++;
+            bool setOk = triggerRefresh ? triggerRefresh(userCtx) : false;
+            refreshedThisTick = true;
+            int64_t probedMHz = 0;
+            if (setOk && readInt(userCtx, "GPU Current Freq MHz", &probedMHz)) {
+                state->freqProbed = true;
+                state->supportsGpuFreq = true;
+            } else {
+                state->freqProbed = true;
+                state->supportsGpuFreq = false;
+            }
+        }
+        /* When gpuUsagePct < 0.5 and passive property is absent:
+         * neither invoke triggerRefresh nor latch freqProbed. */
+    }
+
+    if (state->supportsGpuFreq) {
+        gpu->hasFreq = true;
+        if (gpuUsagePct < 0.5) {
+            /* Idle in RC6: report 0 MHz directly without entering kernel MMIO */
+            gpu->currentFreqMHz = 0;
+            gpu->requestedFreqMHz = 0;
+        } else {
+            if (!refreshedThisTick && triggerRefresh) {
+                state->refreshCallCount++;
+                (void)triggerRefresh(userCtx);
+            }
+            int64_t curMHz = 0;
+            int64_t reqMHz = 0;
+            if (readInt(userCtx, "GPU Current Freq MHz", &curMHz) && curMHz >= 0) {
+                gpu->currentFreqMHz = (uint32_t)curMHz;
+            }
+            if (readInt(userCtx, "GPU Requested Freq MHz", &reqMHz) && reqMHz >= 0) {
+                gpu->requestedFreqMHz = (uint32_t)reqMHz;
+            }
+        }
+    } else {
+        gpu->hasFreq = false;
+        gpu->currentFreqMHz = 0;
+        gpu->requestedFreqMHz = 0;
+    }
+}
+
+uint64_t xs_bridge_gpu_freq_refresh_count(const XSBridgeContext *ctx) {
+    return ctx ? ctx->gpuFreqState.refreshCallCount : 0;
+}
+
 static void xs_sample_gpu_registry(XSBridgeContext *ctx, XSGpuMetrics *gpu) {
     if (ctx->accelService == IO_OBJECT_NULL) {
         ctx->accelService = IOServiceGetMatchingService(
@@ -669,40 +755,13 @@ static void xs_sample_gpu_registry(XSBridgeContext *ctx, XSGpuMetrics *gpu) {
             kIOMainPortDefault, IOServiceMatching("S0ixStandby"));
     }
     if (ctx->s0ixService != IO_OBJECT_NULL) {
-        if (!ctx->s0ixFreqProbed) {
-            ctx->s0ixFreqProbed = true;
-            int64_t curMHz = 0;
-            if (xs_reg_get_int64(ctx->s0ixService, CFSTR("GPU Current Freq MHz"), &curMHz)) {
-                ctx->s0ixSupportsGpuFreq = true;
-            } else if (ctx->refreshGpuFreqDict &&
-                       IORegistryEntrySetCFProperties(ctx->s0ixService, ctx->refreshGpuFreqDict) == KERN_SUCCESS &&
-                       xs_reg_get_int64(ctx->s0ixService, CFSTR("GPU Current Freq MHz"), &curMHz)) {
-                ctx->s0ixSupportsGpuFreq = true;
-            } else {
-                ctx->s0ixSupportsGpuFreq = false;
-            }
-        }
-
-        if (ctx->s0ixSupportsGpuFreq) {
-            gpu->hasFreq = true;
-            if (gpu->usagePct < 0.5) {
-                /* Idle in RC6: report 0 MHz directly without entering kernel MMIO */
-                gpu->currentFreqMHz = 0;
-                gpu->requestedFreqMHz = 0;
-            } else {
-                if (ctx->refreshGpuFreqDict) {
-                    (void)IORegistryEntrySetCFProperties(ctx->s0ixService, ctx->refreshGpuFreqDict);
-                }
-                int64_t curMHz = 0;
-                int64_t reqMHz = 0;
-                if (xs_reg_get_int64(ctx->s0ixService, CFSTR("GPU Current Freq MHz"), &curMHz) && curMHz >= 0) {
-                    gpu->currentFreqMHz = (uint32_t)curMHz;
-                }
-                if (xs_reg_get_int64(ctx->s0ixService, CFSTR("GPU Requested Freq MHz"), &reqMHz) && reqMHz >= 0) {
-                    gpu->requestedFreqMHz = (uint32_t)reqMHz;
-                }
-            }
-        }
+        xs_step_s0ix_gpu_freq(
+            &ctx->gpuFreqState,
+            gpu->usagePct,
+            xs_iokit_read_s0ix_int,
+            xs_iokit_trigger_s0ix_refresh,
+            ctx,
+            gpu);
     }
 }
 
@@ -908,7 +967,8 @@ void xs_bridge_reset_baselines(XSBridgeContext *ctx) {
     ctx->hasTelemetryBaseline = false;
     ctx->hasCpuTickBaseline = false;
     ctx->smcProbed = false;
-    ctx->s0ixFreqProbed = false;
+    ctx->gpuFreqState.freqProbed = false;
+    ctx->gpuFreqState.supportsGpuFreq = false;
     ctx->s0ixCacheValid = false;
 }
 

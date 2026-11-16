@@ -54,6 +54,25 @@ double xs_calc_rapl_watts(uint64_t prevRaw, uint64_t currRaw, uint8_t esuBits, d
 double xs_calc_aperf_mhz(uint64_t deltaAcnt, uint64_t deltaMcnt, double baseMHz);
 double xs_calc_battery_watts(int64_t voltageMV, uint64_t rawInstantAmperage, int32_t *outSignedMA);
 
+typedef struct {
+    bool freqProbed;
+    bool supportsGpuFreq;
+    uint64_t refreshCallCount;
+} XSGpuFreqProbeState;
+
+typedef bool (*XSGpuReadRegIntFn)(void *userCtx, const char *key, int64_t *outVal);
+typedef bool (*XSGpuTriggerRefreshFn)(void *userCtx);
+
+void xs_step_s0ix_gpu_freq(
+    XSGpuFreqProbeState *state,
+    double gpuUsagePct,
+    XSGpuReadRegIntFn readInt,
+    XSGpuTriggerRefreshFn triggerRefresh,
+    void *userCtx,
+    XSGpuMetrics *gpu);
+
+uint64_t xs_bridge_gpu_freq_refresh_count(const XSBridgeContext *ctx);
+
 XSBridgeContext *xs_bridge_create(void);
 void xs_bridge_reset_baselines(XSBridgeContext *ctx);
 void xs_bridge_sample_core(XSBridgeContext *ctx, XSCpuMetrics *cpu, XSGpuMetrics *gpu, XSMemoryMetrics *mem, XSPowerMetrics *pwr);

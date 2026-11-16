@@ -43,10 +43,9 @@ else
         if [[ -n "$WLP_IPV4" ]]; then
             SSH_OPTS+=("-o" "BindAddress=$WLP_IPV4")
         fi
-    else
-        FALLBACK_IPV6="${MAC_IPV6_HOST:-}"
-        echo "==> IPv4 ($TARGET_HOST) 连接不可达，自动切换 IPv6 链路本地地址: $FALLBACK_IPV6"
-        TARGET_HOST="$FALLBACK_IPV6"
+    elif [[ -n "${MAC_IPV6_HOST:-}" ]]; then
+        echo "==> IPv4 ($TARGET_HOST) 连接不可达，自动切换 IPv6 链路本地地址: $MAC_IPV6_HOST"
+        TARGET_HOST="$MAC_IPV6_HOST"
         SSH_OPTS=(-6 "${SSH_BASE_OPTS[@]}" -o ConnectTimeout=10)
         RSYNC_EXTRA=(--ipv6)
     fi

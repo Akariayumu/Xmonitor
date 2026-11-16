@@ -215,6 +215,20 @@ struct XSBridgeContext {
     char cachedLastWakeSource[96];
     char cachedAcEcWakeBlock[96];
     char cachedBatteryFullState[96];
+    uint32_t powerSampleCount;
+    uint64_t lastPowerSampleNs;
+    XSPowerMetrics cachedPowerMetrics;
+    uint32_t gpuRegSampleCount;
+    uint64_t lastGpuRegSampleNs;
+    uint64_t cachedGartUsedBytes;
+    uint64_t cachedGartSizeBytes;
+    uint32_t cachedSinkOk;
+    uint32_t cachedSinkRetries;
+    bool sinkKnownOnRoot;
+    int swapMib[4];
+    size_t swapMibLen;
+    int pressureMib[4];
+    size_t pressureMibLen;
 
     /* Delta baselines */
     bool hasTelemetryBaseline;
@@ -824,41 +838,66 @@ uint64_t xs_bridge_gpu_freq_refresh_count(const XSBridgeContext *ctx) {
     return ctx ? ctx->gpuFreqState.refreshCallCount : 0;
 }
 
-static void xs_sample_gpu_registry(XSBridgeContext *ctx, XSGpuMetrics *gpu) {
-    if (ctx->accelService == IO_OBJECT_NULL) {
-        ctx->accelService = IOServiceGetMatchingService(
-            kIOMainPortDefault, IOServiceMatching("IntelAccelerator"));
-    }
+static void xs_sample_gpu_registry(XSBridgeContext *ctx, uint64_t nowMonoNs, XSGpuMetrics *gpu) {
+    bool canReuseIdleGart = (gpu->usagePct < 0.5) &&
+                            (ctx->gpuRegSampleCount >= 2) &&
+                            (nowMonoNs > ctx->lastGpuRegSampleNs) &&
+                            ((nowMonoNs - ctx->lastGpuRegSampleNs) < 5500000000ULL);
 
-    if (ctx->accelService != IO_OBJECT_NULL) {
-        CFTypeRef perfRef = IORegistryEntryCreateCFProperty(
-            ctx->accelService, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0);
-        if (perfRef && CFGetTypeID(perfRef) == CFDictionaryGetTypeID()) {
-            CFDictionaryRef perf = (CFDictionaryRef)perfRef;
-            /* Read strictly gartUsedBytes / gartSizeBytes; ignore inUseSysMemoryBytes (Gen12 underflow) */
-            int64_t gartUsed = xs_dict_int64_or(perf, CFSTR("gartUsedBytes"), 0);
-            int64_t gartSize = xs_dict_int64_or(perf, CFSTR("gartSizeBytes"), 0);
-            if (gartUsed > 0) gpu->gartUsedBytes = (uint64_t)gartUsed;
-            if (gartSize > 0) gpu->gartSizeBytes = (uint64_t)gartSize;
+    if (canReuseIdleGart) {
+        gpu->gartUsedBytes = ctx->cachedGartUsedBytes;
+        gpu->gartSizeBytes = ctx->cachedGartSizeBytes;
+        gpu->sinkRestoreOk = ctx->cachedSinkOk;
+        gpu->sinkRestoreRetries = ctx->cachedSinkRetries;
+    } else {
+        if (ctx->accelService == IO_OBJECT_NULL) {
+            ctx->accelService = IOServiceGetMatchingService(
+                kIOMainPortDefault, IOServiceMatching("IntelAccelerator"));
         }
-        if (perfRef) {
-            CFRelease(perfRef);
-        }
-    }
 
-    /* TGLSinkRestoreRate: check IntelAccelerator first, then IORegistry Root (WhateverXe telemetry location) */
-    int64_t sinkRaw = 0;
-    bool gotSink = xs_reg_get_int64(ctx->accelService, CFSTR("TGLSinkRestoreRate"), &sinkRaw);
-    if (!gotSink) {
-        if (ctx->rootEntry == IO_OBJECT_NULL) {
-            ctx->rootEntry = IORegistryGetRootEntry(kIOMainPortDefault);
+        if (ctx->accelService != IO_OBJECT_NULL) {
+            CFTypeRef perfRef = IORegistryEntryCreateCFProperty(
+                ctx->accelService, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0);
+            if (perfRef && CFGetTypeID(perfRef) == CFDictionaryGetTypeID()) {
+                CFDictionaryRef perf = (CFDictionaryRef)perfRef;
+                /* Read strictly gartUsedBytes / gartSizeBytes; ignore inUseSysMemoryBytes (Gen12 underflow) */
+                int64_t gartUsed = xs_dict_int64_or(perf, CFSTR("gartUsedBytes"), 0);
+                int64_t gartSize = xs_dict_int64_or(perf, CFSTR("gartSizeBytes"), 0);
+                if (gartUsed > 0) gpu->gartUsedBytes = (uint64_t)gartUsed;
+                if (gartSize > 0) gpu->gartSizeBytes = (uint64_t)gartSize;
+            }
+            if (perfRef) {
+                CFRelease(perfRef);
+            }
         }
-        gotSink = xs_reg_get_int64(ctx->rootEntry, CFSTR("TGLSinkRestoreRate"), &sinkRaw);
-    }
-    if (gotSink && sinkRaw >= 0) {
-        uint64_t u = (uint64_t)sinkRaw;
-        gpu->sinkRestoreRetries = (uint32_t)(u >> 24);
-        gpu->sinkRestoreOk = (uint32_t)(u & 0xFFFFFFU);
+
+        /* TGLSinkRestoreRate: check IntelAccelerator first, then IORegistry Root (WhateverXe telemetry location) */
+        int64_t sinkRaw = 0;
+        bool gotSink = false;
+        if (!ctx->sinkKnownOnRoot) {
+            gotSink = xs_reg_get_int64(ctx->accelService, CFSTR("TGLSinkRestoreRate"), &sinkRaw);
+        }
+        if (!gotSink) {
+            if (ctx->rootEntry == IO_OBJECT_NULL) {
+                ctx->rootEntry = IORegistryGetRootEntry(kIOMainPortDefault);
+            }
+            gotSink = xs_reg_get_int64(ctx->rootEntry, CFSTR("TGLSinkRestoreRate"), &sinkRaw);
+            if (gotSink) {
+                ctx->sinkKnownOnRoot = true;
+            }
+        }
+        if (gotSink && sinkRaw >= 0) {
+            uint64_t u = (uint64_t)sinkRaw;
+            gpu->sinkRestoreRetries = (uint32_t)(u >> 24);
+            gpu->sinkRestoreOk = (uint32_t)(u & 0xFFFFFFU);
+        }
+
+        ctx->gpuRegSampleCount++;
+        ctx->lastGpuRegSampleNs = nowMonoNs;
+        ctx->cachedGartUsedBytes = gpu->gartUsedBytes;
+        ctx->cachedGartSizeBytes = gpu->gartSizeBytes;
+        ctx->cachedSinkOk = gpu->sinkRestoreOk;
+        ctx->cachedSinkRetries = gpu->sinkRestoreRetries;
     }
 
     /* Optional Gen12 GPU frequency export from S0ixStandby (EFI v2.0.1+) */
@@ -900,21 +939,34 @@ static void xs_sample_memory(XSBridgeContext *ctx, XSMemoryMetrics *mem) {
 
     struct xsw_usage swap;
     size_t swapLen = sizeof(swap);
-    if (sysctlbyname("vm.swapusage", &swap, &swapLen, NULL, 0) == 0) {
+    int swapRc = (ctx->swapMibLen > 0)
+        ? sysctl(ctx->swapMib, (u_int)ctx->swapMibLen, &swap, &swapLen, NULL, 0)
+        : sysctlbyname("vm.swapusage", &swap, &swapLen, NULL, 0);
+    if (swapRc == 0) {
         mem->swapUsedBytes = swap.xsu_used;
         mem->swapTotalBytes = swap.xsu_total;
     }
 
     int32_t pressure = 1;
     size_t pLen = sizeof(pressure);
-    if (sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &pLen, NULL, 0) == 0) {
+    int pressRc = (ctx->pressureMibLen > 0)
+        ? sysctl(ctx->pressureMib, (u_int)ctx->pressureMibLen, &pressure, &pLen, NULL, 0)
+        : sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &pLen, NULL, 0);
+    if (pressRc == 0) {
         mem->pressureLevel = pressure;
     } else {
         mem->pressureLevel = 1;
     }
 }
 
-static void xs_sample_power_s0ix(XSBridgeContext *ctx, XSPowerMetrics *pwr) {
+static void xs_sample_power_s0ix(XSBridgeContext *ctx, uint64_t nowMonoNs, XSPowerMetrics *pwr) {
+    if (ctx->powerSampleCount >= 2 &&
+        nowMonoNs > ctx->lastPowerSampleNs &&
+        (nowMonoNs - ctx->lastPowerSampleNs) < 5500000000ULL) {
+        *pwr = ctx->cachedPowerMetrics;
+        return;
+    }
+
     /* 1. AppleSmartBattery */
     if (ctx->batteryService == IO_OBJECT_NULL) {
         ctx->batteryService = IOServiceGetMatchingService(
@@ -1032,6 +1084,10 @@ static void xs_sample_power_s0ix(XSBridgeContext *ctx, XSPowerMetrics *pwr) {
             memcpy(pwr->batteryFullState, ctx->cachedBatteryFullState, sizeof(pwr->batteryFullState));
         }
     }
+
+    ctx->powerSampleCount++;
+    ctx->lastPowerSampleNs = nowMonoNs;
+    ctx->cachedPowerMetrics = *pwr;
 }
 
 /* ========================================================================== *
@@ -1918,6 +1974,15 @@ XSBridgeContext *xs_bridge_create(void) {
         ctx->baseMHz = 2800.0;
     }
 
+    size_t smLen = 4;
+    if (sysctlnametomib("vm.swapusage", ctx->swapMib, &smLen) == 0) {
+        ctx->swapMibLen = smLen;
+    }
+    size_t pmLen = 4;
+    if (sysctlnametomib("kern.memorystatus_vm_pressure_level", ctx->pressureMib, &pmLen) == 0) {
+        ctx->pressureMibLen = pmLen;
+    }
+
     const void *keys[1] = { CFSTR("refreshGpuFreq") };
     const void *vals[1] = { kCFBooleanTrue };
     ctx->refreshGpuFreqDict = CFDictionaryCreate(
@@ -1940,6 +2005,11 @@ void xs_bridge_reset_baselines(XSBridgeContext *ctx) {
     ctx->gpuFreqState.freqProbed = false;
     ctx->gpuFreqState.supportsGpuFreq = false;
     ctx->s0ixCacheValid = false;
+    ctx->powerSampleCount = 0;
+    ctx->lastPowerSampleNs = 0;
+    ctx->gpuRegSampleCount = 0;
+    ctx->lastGpuRegSampleNs = 0;
+    ctx->sinkKnownOnRoot = false;
     ctx->hasDiskBaseline = false;
     ctx->hasNetBaseline = false;
     ctx->hasProcBaseline = false;
@@ -2098,13 +2168,13 @@ void xs_bridge_sample_core(
     }
 
     /* 3. GPU GART / TGLSinkRestoreRate / optional S0ixStandby GPU MHz */
-    xs_sample_gpu_registry(ctx, &localGpu);
+    xs_sample_gpu_registry(ctx, nowMonoNs, &localGpu);
 
     /* 4. Memory & Swap & VM Pressure */
     xs_sample_memory(ctx, &localMem);
 
     /* 5. SmartBattery & S0ixStandby */
-    xs_sample_power_s0ix(ctx, &localPwr);
+    xs_sample_power_s0ix(ctx, nowMonoNs, &localPwr);
 
     if (cpu) *cpu = localCpu;
     if (gpu) *gpu = localGpu;

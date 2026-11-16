@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 struct TestFailure: Error, CustomStringConvertible {
@@ -58,6 +59,9 @@ func expectApprox(
 @MainActor
 struct XSenseiTestRunner {
     static func main() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
         var failures: [String] = []
 
         do {
@@ -74,6 +78,24 @@ struct XSenseiTestRunner {
             print("[PASS] All EngineAndCollectorsTests passed")
         } catch {
             let desc = "[FAIL] EngineAndCollectorsTests: \(error)"
+            fputs("\(desc)\n", stderr)
+            failures.append(desc)
+        }
+
+        do {
+            try runFormattersTests()
+            print("[PASS] All FormattersTests passed")
+        } catch {
+            let desc = "[FAIL] FormattersTests: \(error)"
+            fputs("\(desc)\n", stderr)
+            failures.append(desc)
+        }
+
+        do {
+            try runWidgetLayoutTests()
+            print("[PASS] All WidgetLayoutTests passed")
+        } catch {
+            let desc = "[FAIL] WidgetLayoutTests: \(error)"
             fputs("\(desc)\n", stderr)
             failures.append(desc)
         }

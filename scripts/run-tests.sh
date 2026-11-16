@@ -38,6 +38,7 @@ swiftc -O -swift-version 5 -parse-as-library \
     "${SWIFT_FILES[@]}" \
     build/HardwareBridge.o \
     -framework AppKit \
+    -framework QuartzCore \
     -framework SwiftUI \
     -framework IOKit \
     -framework CoreFoundation \

@@ -21,18 +21,19 @@ final class TelemetryEngine: ObservableObject {
     private static let interactiveInterval: TimeInterval = 1.0
     private static let smartRefreshSeconds: TimeInterval = 30.0
     private static let volumeRefreshSeconds: TimeInterval = 30.0
-    private static let ambientWifiRefreshSeconds: TimeInterval = 6.0
+    private static let ambientWifiRefreshSeconds: TimeInterval = 60.0
 
     @Published private(set) var snapshot: SystemSnapshot = .empty
-    @Published private(set) var cpuHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
-    @Published private(set) var gpuHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
-    @Published private(set) var ramHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
-    @Published private(set) var powerHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
-    @Published private(set) var netRxHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
-    @Published private(set) var netTxHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
-    @Published private(set) var diskReadHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
-    @Published private(set) var diskWriteHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
+    private(set) var cpuHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
+    private(set) var gpuHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
+    private(set) var ramHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
+    private(set) var powerHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
+    private(set) var netRxHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
+    private(set) var netTxHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
+    private(set) var diskReadHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
+    private(set) var diskWriteHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
     @Published private(set) var currentInterval: TimeInterval = ambientInterval
+    var requiresFastAmbientIoNet: (() -> Bool)?
 
     private nonisolated let cleanupBox: EngineCleanupBox
     private var bridgeCtx: OpaquePointer? { cleanupBox.bridgeCtx }
@@ -47,6 +48,7 @@ final class TelemetryEngine: ObservableObject {
     private var lastSmartRefreshUptime: TimeInterval = 0
     private var lastVolumeRefreshUptime: TimeInterval = 0
     private var lastWifiRefreshUptime: TimeInterval = 0
+    private var lastIoNetRefreshUptime: TimeInterval = 0
 
     private var cachedVolumeTotalBytes: UInt64 = 0
     private var cachedVolumeAvailableBytes: UInt64 = 0
@@ -136,6 +138,7 @@ final class TelemetryEngine: ObservableObject {
         lastSmartRefreshUptime = 0
         lastVolumeRefreshUptime = 0
         lastWifiRefreshUptime = 0
+        lastIoNetRefreshUptime = 0
     }
 
     private func applySchedule(triggerImmediateSample: Bool) {
@@ -168,7 +171,7 @@ final class TelemetryEngine: ObservableObject {
         if intervalChanged || timer == nil {
             invalidateTimer()
             let newTimer = Timer(timeInterval: target, repeats: true) { [weak self] _ in
-                Task { @MainActor [weak self] in
+                MainActor.assumeIsolated {
                     self?.refreshNow()
                 }
             }
@@ -215,7 +218,8 @@ final class TelemetryEngine: ObservableObject {
             isInteractive ||
             (uptime - lastWifiRefreshUptime >= Self.ambientWifiRefreshSeconds)
         if shouldRefreshWifi {
-            cachedWifi = Self.sampleWifi()
+            let queryIdentity = !hasSampledOnce || isInteractive || (cachedWifi.ssid != nil) || !cachedWifi.isAssociated
+            cachedWifi = Self.sampleWifi(queryIdentity: queryIdentity, previous: cachedWifi)
             lastWifiRefreshUptime = uptime
             if !cachedWifi.interfaceName.isEmpty, let bridgeCtx {
                 cachedWifi.interfaceName.withCString { xs_bridge_set_preferred_net_if(bridgeCtx, $0) }
@@ -244,9 +248,18 @@ final class TelemetryEngine: ObservableObject {
         var cSto = XSStorageMetrics()
         var cNet = XSNetworkMetrics()
 
+        let shouldRefreshIoNet = !hasSampledOnce ||
+            isInteractive ||
+            shouldRefreshSmart ||
+            (requiresFastAmbientIoNet?() ?? true) ||
+            (uptime - lastIoNetRefreshUptime >= 6.0)
+
         if let bridgeCtx {
             xs_bridge_sample_core(bridgeCtx, &cCpu, &cGpu, &cMem, &cPwr)
-            xs_bridge_sample_io_net(bridgeCtx, shouldRefreshSmart, &cSto, &cNet)
+            if shouldRefreshIoNet {
+                xs_bridge_sample_io_net(bridgeCtx, shouldRefreshSmart, &cSto, &cNet)
+                lastIoNetRefreshUptime = uptime
+            }
         }
 
         var procs: [ProcessEntry] = snapshot.topProcesses
@@ -262,13 +275,32 @@ final class TelemetryEngine: ObservableObject {
         let cpuSnap = CpuSnapshot(c: cCpu)
         let gpuSnap = GpuSnapshot(c: cGpu)
         let memSnap = MemorySnapshot(c: cMem)
-        let stoSnap = StorageSnapshot(
-            c: cSto,
-            totalBytes: cachedVolumeTotalBytes,
-            availableBytes: cachedVolumeAvailableBytes
-        )
+        let stoSnap: StorageSnapshot
+        let netSnap: NetworkSnapshot
+        if shouldRefreshIoNet {
+            stoSnap = StorageSnapshot(
+                c: cSto,
+                totalBytes: cachedVolumeTotalBytes,
+                availableBytes: cachedVolumeAvailableBytes
+            )
+            netSnap = NetworkSnapshot(c: cNet)
+        } else {
+            var reusedSto = snapshot.storage
+            reusedSto.totalBytes = cachedVolumeTotalBytes
+            reusedSto.availableBytes = cachedVolumeAvailableBytes
+            stoSnap = reusedSto
+            netSnap = snapshot.network
+        }
         let pwrSnap = PowerSnapshot(c: cPwr)
-        let netSnap = NetworkSnapshot(c: cNet)
+
+        cpuHistory.append(cpuSnap.totalUsage)
+        gpuHistory.append(gpuSnap.usagePct)
+        ramHistory.append(memSnap.usedPercent)
+        powerHistory.append(cpuSnap.packagePowerW)
+        netRxHistory.append(Double(netSnap.rxBytesPerSec))
+        netTxHistory.append(Double(netSnap.txBytesPerSec))
+        diskReadHistory.append(Double(stoSnap.readBytesPerSec))
+        diskWriteHistory.append(Double(stoSnap.writeBytesPerSec))
 
         snapshot = SystemSnapshot(
             cpu: cpuSnap,
@@ -283,15 +315,6 @@ final class TelemetryEngine: ObservableObject {
             uptimeSeconds: uptime,
             timestamp: Date()
         )
-
-        cpuHistory.append(cpuSnap.totalUsage)
-        gpuHistory.append(gpuSnap.usagePct)
-        ramHistory.append(memSnap.usedPercent)
-        powerHistory.append(cpuSnap.packagePowerW)
-        netRxHistory.append(Double(netSnap.rxBytesPerSec))
-        netTxHistory.append(Double(netSnap.txBytesPerSec))
-        diskReadHistory.append(Double(stoSnap.readBytesPerSec))
-        diskWriteHistory.append(Double(stoSnap.writeBytesPerSec))
 
         hasSampledOnce = true
     }
@@ -330,14 +353,14 @@ final class TelemetryEngine: ObservableObject {
         return (total, min(avail, total))
     }
 
-    private static func sampleWifi() -> WifiSnapshot {
+    private static func sampleWifi(queryIdentity: Bool = true, previous: WifiSnapshot = .empty) -> WifiSnapshot {
         guard let iface = CWWiFiClient.shared().interface() else {
             return .empty
         }
         let ifName = iface.interfaceName ?? "en1"
         let powered = iface.powerOn()
-        let rawSSID = iface.ssid()
-        let rawBSSID = iface.bssid()
+        let rawSSID = queryIdentity ? iface.ssid() : previous.ssid
+        let rawBSSID = queryIdentity ? iface.bssid() : previous.bssid
         let channel = iface.wlanChannel()
         let rssi = iface.rssiValue()
         let noise = iface.noiseMeasurement()

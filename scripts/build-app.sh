@@ -39,6 +39,7 @@ swiftc -O -swift-version 5 -parse-as-library \
     "${SWIFT_SOURCES[@]}" \
     build/HardwareBridge.o \
     -framework AppKit \
+    -framework QuartzCore \
     -framework SwiftUI \
     -framework IOKit \
     -framework CoreFoundation \
@@ -98,8 +99,12 @@ echo "==> ${APP}（签名：${SIGN_IDENTITY}，权限文件：${ENTITLEMENTS_FIL
 
 if [[ "${1:-}" == "--install" ]]; then
     pkill -x XSensei 2>/dev/null || true
+    for _ in {1..20}; do
+        pgrep -x XSensei >/dev/null 2>&1 || break
+        sleep 0.05
+    done
     rm -rf /Applications/XSensei.app
     cp -R "$APP" /Applications/
-    open /Applications/XSensei.app
+    open -a /Applications/XSensei.app
     echo "==> 已安装并启动 /Applications/XSensei.app"
 fi

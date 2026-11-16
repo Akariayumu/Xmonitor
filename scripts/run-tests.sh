@@ -42,6 +42,7 @@ swiftc -O -swift-version 5 -parse-as-library \
     -framework IOKit \
     -framework CoreFoundation \
     -framework CoreWLAN \
+    -framework Security \
     -framework ServiceManagement \
     -o build/XSenseiTests
 

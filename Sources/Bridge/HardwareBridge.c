@@ -1,18 +1,81 @@
 #include "HardwareBridge.h"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOCFPlugIn.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/storage/nvme/NVMeSMARTLibExternal.h>
+#include <Security/SecTask.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <ifaddrs.h>
+#include <libproc.h>
 #include <mach/host_info.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <mach/mach_time.h>
 #include <mach/processor_info.h>
 #include <mach/vm_map.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <netinet/in.h>
+#include <os/lock.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/proc_info.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <time.h>
 #include <x86intrin.h>
+#include <xpc/xpc.h>
+
+/* ========================================================================== *
+ * Dynamic libsysmon.dylib types & attribute constants
+ * ========================================================================== */
+
+typedef void *xs_sysmon_request_t;
+typedef void *xs_sysmon_table_t;
+typedef void *xs_sysmon_row_t;
+typedef void (^xs_sysmon_table_handler_t)(xs_sysmon_table_t table);
+typedef bool (^xs_sysmon_row_applier_t)(xs_sysmon_row_t row);
+
+typedef xs_sysmon_request_t (*fn_sysmon_request_create)(uint64_t type, xs_sysmon_table_handler_t handler);
+typedef void (*fn_sysmon_request_add_attribute)(xs_sysmon_request_t req, uint32_t attr);
+typedef void (*fn_sysmon_request_execute)(xs_sysmon_request_t req);
+typedef void (*fn_sysmon_request_cancel)(xs_sysmon_request_t req);
+typedef void (*fn_sysmon_table_apply)(xs_sysmon_table_t table, xs_sysmon_row_applier_t applier);
+typedef xpc_object_t (*fn_sysmon_row_get_value)(xs_sysmon_row_t row, uint32_t attr);
+typedef void (*fn_sysmon_release)(void *obj);
+
+#define XS_SYSMON_REQ_PROCESS       1ULL
+#define XS_SYSMON_ATTR_PID          0x01U
+#define XS_SYSMON_ATTR_UID          0x03U
+#define XS_SYSMON_ATTR_COMM         0x0cU
+#define XS_SYSMON_ATTR_NAME         0x0dU
+#define XS_SYSMON_ATTR_START_NS     0x14U
+#define XS_SYSMON_ATTR_RESIDENT     0x16U
+#define XS_SYSMON_ATTR_USER_NS      0x17U
+#define XS_SYSMON_ATTR_SYS_NS       0x18U
+#define XS_SYSMON_ATTR_FOOTPRINT    0x42U
+
+typedef struct {
+    int32_t pid;
+    uint32_t _pad;
+    uint64_t startKey;
+    uint64_t cpuNs;
+} XSProcDeltaSlot;
+
+typedef struct {
+    int32_t pid;
+    uint32_t uid;
+    uint64_t startKey;
+    uint64_t cpuNs;
+    uint64_t memoryBytes;
+    double cpuPct;
+    char name[64];
+} XSProcRawRow;
 
 /* ========================================================================== *
  * Dynamic libIOReport.dylib types & function pointers
@@ -165,6 +228,55 @@ struct XSBridgeContext {
     uint32_t prevSys[XS_MAX_THREADS];
     uint32_t prevNice[XS_MAX_THREADS];
     uint32_t prevIdle[XS_MAX_THREADS];
+
+    mach_timebase_info_data_t timebase;
+
+    /* Storage SMART & IOBlockStorageDriver handles */
+    bool storageProbed;
+    io_service_t nvmeBlockService;
+    io_service_t blockDriverService;
+    IOCFPlugInInterface **nvmePlugIn;
+    IONVMeSMARTInterface **nvmeSmartIf;
+    char nvmeModel[64];
+    bool hasSmartCache;
+    XSStorageMetrics cachedSmart;
+
+    bool hasDiskBaseline;
+    uint64_t prevDiskMonoNs;
+    uint64_t prevDiskReadBytes;
+    uint64_t prevDiskWriteBytes;
+    uint64_t prevDiskReadOps;
+    uint64_t prevDiskWriteOps;
+
+    /* Network primary interface & delta baselines */
+    char preferredNetIf[16];
+    bool hasNetBaseline;
+    char prevNetIf[16];
+    uint64_t prevNetMonoNs;
+    uint64_t prevNetRxBytes;
+    uint64_t prevNetTxBytes;
+
+    /* Dual-path Process collector (libsysmon when entitled + libproc fallback) */
+    bool sysmonProbed;
+    bool hasSysmonEntitlement;
+    void *sysmonDylib;
+    fn_sysmon_request_create pSysmonReqCreate;
+    fn_sysmon_request_add_attribute pSysmonReqAddAttr;
+    fn_sysmon_request_execute pSysmonReqExecute;
+    fn_sysmon_request_cancel pSysmonReqCancel;
+    fn_sysmon_table_apply pSysmonTableApply;
+    fn_sysmon_row_get_value pSysmonRowGetValue;
+    fn_sysmon_release pSysmonRelease;
+
+    bool hasProcBaseline;
+    uint64_t prevProcMonoNs;
+    size_t procTableCap; /* power-of-two open-addressed hash table capacity */
+    XSProcDeltaSlot *prevProcTable;
+    XSProcDeltaSlot *currProcTable;
+    int *pidBuf;
+    size_t pidBufCap;
+    XSProcRawRow *procRowBuf;
+    size_t procRowCap;
 };
 
 /* ========================================================================== *
@@ -923,6 +1035,858 @@ static void xs_sample_power_s0ix(XSBridgeContext *ctx, XSPowerMetrics *pwr) {
 }
 
 /* ========================================================================== *
+ * Storage (NVMe SMART + IOBlockStorageDriver) & Network (getifaddrs)
+ * ========================================================================== */
+
+static void xs_trim_copy_cstr(const char *src, size_t maxSrcLen, char *dst, size_t dstCap) {
+    if (!dst || dstCap == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    size_t len = 0;
+    while (len < maxSrcLen && src[len] != '\0') {
+        len++;
+    }
+    size_t start = 0;
+    while (start < len && isspace((unsigned char)src[start])) {
+        start++;
+    }
+    while (len > start && isspace((unsigned char)src[len - 1])) {
+        len--;
+    }
+    size_t copyLen = len - start;
+    if (copyLen >= dstCap) {
+        copyLen = dstCap - 1;
+    }
+    if (copyLen > 0) {
+        memcpy(dst, src + start, copyLen);
+    }
+    dst[copyLen] = '\0';
+}
+
+static uint16_t xs_read_u16_le(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static uint64_t xs_read_u64_le(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v |= ((uint64_t)p[i]) << (i * 8);
+    }
+    return v;
+}
+
+static void xs_init_storage_handles(XSBridgeContext *ctx) {
+    if (ctx->storageProbed) {
+        return;
+    }
+    ctx->storageProbed = true;
+
+    io_iterator_t iter = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(
+            kIOMainPortDefault,
+            IOServiceMatching("IONVMeBlockStorageDevice"),
+            &iter) == KERN_SUCCESS &&
+        iter != IO_OBJECT_NULL) {
+        io_service_t best = IO_OBJECT_NULL;
+        io_service_t obj = IO_OBJECT_NULL;
+        while ((obj = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
+            bool isInternal = false;
+            CFTypeRef protoRef = IORegistryEntryCreateCFProperty(
+                obj, CFSTR("Protocol Characteristics"), kCFAllocatorDefault, 0);
+            if (protoRef && CFGetTypeID(protoRef) == CFDictionaryGetTypeID()) {
+                char loc[32];
+                xs_dict_copy_cstr(
+                    (CFDictionaryRef)protoRef,
+                    CFSTR("Physical Interconnect Location"),
+                    loc,
+                    sizeof(loc));
+                if (strcmp(loc, "Internal") == 0) {
+                    isInternal = true;
+                }
+            }
+            if (protoRef) {
+                CFRelease(protoRef);
+            }
+
+            if (best == IO_OBJECT_NULL) {
+                best = obj;
+                if (isInternal) {
+                    break;
+                }
+            } else if (isInternal) {
+                IOObjectRelease(best);
+                best = obj;
+                break;
+            } else {
+                IOObjectRelease(obj);
+            }
+        }
+        IOObjectRelease(iter);
+        ctx->nvmeBlockService = best;
+    }
+
+    if (ctx->nvmeBlockService != IO_OBJECT_NULL) {
+        /* 1. Extract NVMe model string from Device Characteristics -> Product Name (or parent controller) */
+        CFTypeRef devChars = IORegistryEntryCreateCFProperty(
+            ctx->nvmeBlockService, CFSTR("Device Characteristics"), kCFAllocatorDefault, 0);
+        if (devChars && CFGetTypeID(devChars) == CFDictionaryGetTypeID()) {
+            char rawModel[64];
+            xs_dict_copy_cstr(
+                (CFDictionaryRef)devChars, CFSTR("Product Name"), rawModel, sizeof(rawModel));
+            xs_trim_copy_cstr(rawModel, sizeof(rawModel), ctx->nvmeModel, sizeof(ctx->nvmeModel));
+        }
+        if (devChars) {
+            CFRelease(devChars);
+        }
+
+        if (ctx->nvmeModel[0] == '\0') {
+            io_registry_entry_t parentCtrl = IO_OBJECT_NULL;
+            if (IORegistryEntryGetParentEntry(
+                    ctx->nvmeBlockService, kIOServicePlane, &parentCtrl) == KERN_SUCCESS &&
+                parentCtrl != IO_OBJECT_NULL) {
+                CFTypeRef modelRef = IORegistryEntryCreateCFProperty(
+                    parentCtrl, CFSTR("Model Number"), kCFAllocatorDefault, 0);
+                if (modelRef && CFGetTypeID(modelRef) == CFStringGetTypeID()) {
+                    char rawModel[64];
+                    if (CFStringGetCString(
+                            (CFStringRef)modelRef, rawModel, sizeof(rawModel), kCFStringEncodingUTF8)) {
+                        xs_trim_copy_cstr(rawModel, sizeof(rawModel), ctx->nvmeModel, sizeof(ctx->nvmeModel));
+                    }
+                }
+                if (modelRef) {
+                    CFRelease(modelRef);
+                }
+                IOObjectRelease(parentCtrl);
+            }
+        }
+
+        /* 2. Locate child IOBlockStorageDriver specifically bound to this internal NVMe device */
+        io_iterator_t childIter = IO_OBJECT_NULL;
+        if (IORegistryEntryGetChildIterator(
+                ctx->nvmeBlockService, kIOServicePlane, &childIter) == KERN_SUCCESS &&
+            childIter != IO_OBJECT_NULL) {
+            io_service_t child = IO_OBJECT_NULL;
+            while ((child = IOIteratorNext(childIter)) != IO_OBJECT_NULL) {
+                if (IOObjectConformsTo(child, "IOBlockStorageDriver")) {
+                    ctx->blockDriverService = child;
+                    break;
+                }
+                IOObjectRelease(child);
+            }
+            IOObjectRelease(childIter);
+        }
+
+        /* 3. Open NVMeSMARTLib.plugin COM interface (released cleanly in xs_bridge_destroy) */
+        IOCFPlugInInterface **plugIn = NULL;
+        SInt32 score = 0;
+        if (IOCreatePlugInInterfaceForService(
+                ctx->nvmeBlockService,
+                kIONVMeSMARTUserClientTypeID,
+                kIOCFPlugInInterfaceID,
+                &plugIn,
+                &score) == KERN_SUCCESS &&
+            plugIn != NULL) {
+            IONVMeSMARTInterface **smartIf = NULL;
+            HRESULT hr = (*plugIn)->QueryInterface(
+                plugIn,
+                CFUUIDGetUUIDBytes(kIONVMeSMARTInterfaceID),
+                (LPVOID *)&smartIf);
+            if (hr == S_OK && smartIf != NULL) {
+                ctx->nvmePlugIn = plugIn;
+                ctx->nvmeSmartIf = smartIf;
+            } else {
+                IODestroyPlugInInterface(plugIn);
+            }
+        }
+    }
+
+    if (ctx->blockDriverService == IO_OBJECT_NULL) {
+        ctx->blockDriverService = IOServiceGetMatchingService(
+            kIOMainPortDefault, IOServiceMatching("IOBlockStorageDriver"));
+    }
+}
+
+static void xs_sample_storage(XSBridgeContext *ctx, bool refreshSmart, XSStorageMetrics *sto) {
+    xs_init_storage_handles(ctx);
+
+    if (ctx->nvmeModel[0] != '\0') {
+        memcpy(sto->model, ctx->nvmeModel, sizeof(sto->model));
+        sto->model[sizeof(sto->model) - 1] = '\0';
+    }
+
+    /* 1. NVMe SMART Log Page 0x02 (512 bytes) */
+    if ((refreshSmart || !ctx->hasSmartCache) && ctx->nvmeSmartIf != NULL) {
+        NVMeSMARTData smartData;
+        memset(&smartData, 0, sizeof(smartData));
+
+        IOReturn kr = kIOReturnError;
+        if ((*ctx->nvmeSmartIf)->SMARTReadData != NULL) {
+            kr = (*ctx->nvmeSmartIf)->SMARTReadData(ctx->nvmeSmartIf, &smartData);
+        }
+        if (kr != kIOReturnSuccess && (*ctx->nvmeSmartIf)->GetLogPage != NULL) {
+            kr = (*ctx->nvmeSmartIf)->GetLogPage(
+                ctx->nvmeSmartIf,
+                &smartData,
+                0x02U,
+                (uint32_t)(sizeof(NVMeSMARTData) / 4U) - 1U);
+        }
+
+        if (kr == kIOReturnSuccess) {
+            const uint8_t *buf = (const uint8_t *)&smartData;
+            uint16_t tempK = xs_read_u16_le(buf + 1);
+            XSStorageMetrics cached;
+            memset(&cached, 0, sizeof(cached));
+            cached.hasSmart = (tempK > 0);
+            cached.tempC = (tempK > 0) ? ((int32_t)tempK - 273) : 0;
+            cached.availableSparePct = (int32_t)buf[3];
+            cached.lifeUsedPct = (int32_t)buf[5];
+            cached.dataReadTB = ((double)xs_read_u64_le(buf + 32) * 512000.0) / 1e12;
+            cached.dataWrittenTB = ((double)xs_read_u64_le(buf + 48) * 512000.0) / 1e12;
+            cached.powerCycles = xs_read_u64_le(buf + 112);
+            cached.powerOnHours = xs_read_u64_le(buf + 128);
+            cached.unsafeShutdowns = xs_read_u64_le(buf + 144);
+
+            if (ctx->nvmeModel[0] == '\0' && (*ctx->nvmeSmartIf)->GetIdentifyData != NULL) {
+                NVMeIdentifyControllerStruct idCtrl;
+                memset(&idCtrl, 0, sizeof(idCtrl));
+                if ((*ctx->nvmeSmartIf)->GetIdentifyData(ctx->nvmeSmartIf, &idCtrl, 0) == kIOReturnSuccess) {
+                    xs_trim_copy_cstr(
+                        (const char *)idCtrl.MODEL_NUMBER,
+                        sizeof(idCtrl.MODEL_NUMBER),
+                        ctx->nvmeModel,
+                        sizeof(ctx->nvmeModel));
+                }
+            }
+            memcpy(cached.model, ctx->nvmeModel, sizeof(cached.model));
+            cached.model[sizeof(cached.model) - 1] = '\0';
+
+            ctx->cachedSmart = cached;
+            ctx->hasSmartCache = cached.hasSmart;
+        }
+    }
+
+    if (ctx->hasSmartCache) {
+        sto->hasSmart = ctx->cachedSmart.hasSmart;
+        sto->tempC = ctx->cachedSmart.tempC;
+        sto->lifeUsedPct = ctx->cachedSmart.lifeUsedPct;
+        sto->availableSparePct = ctx->cachedSmart.availableSparePct;
+        sto->dataReadTB = ctx->cachedSmart.dataReadTB;
+        sto->dataWrittenTB = ctx->cachedSmart.dataWrittenTB;
+        sto->powerOnHours = ctx->cachedSmart.powerOnHours;
+        sto->powerCycles = ctx->cachedSmart.powerCycles;
+        sto->unsafeShutdowns = ctx->cachedSmart.unsafeShutdowns;
+        if (ctx->cachedSmart.model[0] != '\0') {
+            memcpy(sto->model, ctx->cachedSmart.model, sizeof(sto->model));
+        }
+    }
+
+    /* 2. IOBlockStorageDriver Statistics delta */
+    if (ctx->blockDriverService != IO_OBJECT_NULL) {
+        CFTypeRef statsRef = IORegistryEntryCreateCFProperty(
+            ctx->blockDriverService, CFSTR("Statistics"), kCFAllocatorDefault, 0);
+        if (statsRef && CFGetTypeID(statsRef) == CFDictionaryGetTypeID()) {
+            CFDictionaryRef stats = (CFDictionaryRef)statsRef;
+            uint64_t rBytes = (uint64_t)xs_dict_int64_or(stats, CFSTR("Bytes (Read)"), 0);
+            uint64_t wBytes = (uint64_t)xs_dict_int64_or(stats, CFSTR("Bytes (Write)"), 0);
+            uint64_t rOps = (uint64_t)xs_dict_int64_or(stats, CFSTR("Operations (Read)"), 0);
+            uint64_t wOps = (uint64_t)xs_dict_int64_or(stats, CFSTR("Operations (Write)"), 0);
+
+            uint64_t nowNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            if (ctx->hasDiskBaseline) {
+                double dtSec = (nowNs > ctx->prevDiskMonoNs)
+                    ? ((double)(nowNs - ctx->prevDiskMonoNs) / 1e9)
+                    : 0.0;
+                if (dtSec >= 0.05 && dtSec <= 10.0) {
+                    if (rBytes >= ctx->prevDiskReadBytes) {
+                        sto->readBytesPerSec = (uint64_t)((double)(rBytes - ctx->prevDiskReadBytes) / dtSec);
+                    }
+                    if (wBytes >= ctx->prevDiskWriteBytes) {
+                        sto->writeBytesPerSec = (uint64_t)((double)(wBytes - ctx->prevDiskWriteBytes) / dtSec);
+                    }
+                    if (rOps >= ctx->prevDiskReadOps) {
+                        sto->readIOPS = (double)(rOps - ctx->prevDiskReadOps) / dtSec;
+                    }
+                    if (wOps >= ctx->prevDiskWriteOps) {
+                        sto->writeIOPS = (double)(wOps - ctx->prevDiskWriteOps) / dtSec;
+                    }
+                    ctx->prevDiskMonoNs = nowNs;
+                    ctx->prevDiskReadBytes = rBytes;
+                    ctx->prevDiskWriteBytes = wBytes;
+                    ctx->prevDiskReadOps = rOps;
+                    ctx->prevDiskWriteOps = wOps;
+                } else if (dtSec > 10.0 || dtSec <= 0.0) {
+                    ctx->prevDiskMonoNs = nowNs;
+                    ctx->prevDiskReadBytes = rBytes;
+                    ctx->prevDiskWriteBytes = wBytes;
+                    ctx->prevDiskReadOps = rOps;
+                    ctx->prevDiskWriteOps = wOps;
+                }
+            } else {
+                ctx->hasDiskBaseline = true;
+                ctx->prevDiskMonoNs = nowNs;
+                ctx->prevDiskReadBytes = rBytes;
+                ctx->prevDiskWriteBytes = wBytes;
+                ctx->prevDiskReadOps = rOps;
+                ctx->prevDiskWriteOps = wOps;
+            }
+        }
+        if (statsRef) {
+            CFRelease(statsRef);
+        }
+    }
+}
+
+typedef struct {
+    char name[16];
+    bool seenLink;
+    bool linkUp;
+    bool hasIPv4;
+    bool hasIPv6;
+    bool hasGlobalIPv6;
+    uint64_t rxBytes;
+    uint64_t txBytes;
+    char ipv4[46];
+    char ipv6[64];
+} XSIfCandidate;
+
+static bool xs_is_ignored_net_if(const char *name) {
+    if (!name || name[0] == '\0') return true;
+    return strncmp(name, "lo", 2) == 0 ||
+           strncmp(name, "utun", 4) == 0 ||
+           strncmp(name, "gif", 3) == 0 ||
+           strncmp(name, "stf", 3) == 0 ||
+           strncmp(name, "XHC", 3) == 0 ||
+           strncmp(name, "awdl", 4) == 0 ||
+           strncmp(name, "llw", 3) == 0 ||
+           strncmp(name, "ap", 2) == 0 ||
+           strncmp(name, "anpi", 4) == 0 ||
+           strncmp(name, "bridge", 6) == 0;
+}
+
+static void xs_sample_network(XSBridgeContext *ctx, XSNetworkMetrics *net) {
+    struct ifaddrs *ifap = NULL;
+    if (getifaddrs(&ifap) != 0 || !ifap) {
+        return;
+    }
+
+    XSIfCandidate cands[16];
+    size_t candCount = 0;
+    memset(cands, 0, sizeof(cands));
+
+    for (struct ifaddrs *ifa = ifap; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if ((ifa->ifa_flags & IFF_LOOPBACK) != 0) continue;
+        if ((ifa->ifa_flags & IFF_UP) == 0) continue;
+        if (xs_is_ignored_net_if(ifa->ifa_name)) continue;
+
+        XSIfCandidate *slot = NULL;
+        for (size_t i = 0; i < candCount; ++i) {
+            if (strcmp(cands[i].name, ifa->ifa_name) == 0) {
+                slot = &cands[i];
+                break;
+            }
+        }
+        if (!slot) {
+            if (candCount >= sizeof(cands) / sizeof(cands[0])) continue;
+            slot = &cands[candCount++];
+            strncpy(slot->name, ifa->ifa_name, sizeof(slot->name) - 1);
+            slot->name[sizeof(slot->name) - 1] = '\0';
+        }
+
+        sa_family_t fam = ifa->ifa_addr->sa_family;
+        if (fam == AF_LINK && ifa->ifa_data != NULL) {
+            const struct if_data *ifd = (const struct if_data *)ifa->ifa_data;
+            slot->seenLink = true;
+            slot->rxBytes = (uint64_t)ifd->ifi_ibytes;
+            slot->txBytes = (uint64_t)ifd->ifi_obytes;
+#ifdef LINK_STATE_UP
+            slot->linkUp = (ifd->ifi_link_state == LINK_STATE_UP);
+#else
+            slot->linkUp = ((ifa->ifa_flags & IFF_RUNNING) != 0);
+#endif
+        } else if (fam == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)ifa->ifa_addr;
+            if (inet_ntop(AF_INET, &sin->sin_addr, slot->ipv4, sizeof(slot->ipv4)) != NULL) {
+                slot->hasIPv4 = true;
+            }
+        } else if (fam == AF_INET6) {
+            struct sockaddr_in6 sin6;
+            memcpy(&sin6, ifa->ifa_addr, sizeof(sin6));
+            bool isLinkLocal = IN6_IS_ADDR_LINKLOCAL(&sin6.sin6_addr) ||
+                               IN6_IS_ADDR_MC_LINKLOCAL(&sin6.sin6_addr);
+            if (isLinkLocal) {
+                /* Strip XNU kernel embedded scope ID from link-local IPv6 word 1 */
+                sin6.sin6_addr.__u6_addr.__u6_addr16[1] = 0;
+            }
+            if (!slot->hasIPv6 || (!isLinkLocal && !slot->hasGlobalIPv6)) {
+                if (inet_ntop(AF_INET6, &sin6.sin6_addr, slot->ipv6, sizeof(slot->ipv6)) != NULL) {
+                    slot->hasIPv6 = true;
+                    if (!isLinkLocal) {
+                        slot->hasGlobalIPv6 = true;
+                    }
+                }
+            }
+        }
+    }
+
+    freeifaddrs(ifap);
+
+    if (candCount == 0) {
+        return;
+    }
+
+    const char *pref = (ctx->preferredNetIf[0] != '\0') ? ctx->preferredNetIf : "en1";
+    const XSIfCandidate *best = NULL;
+    int bestScore = -1;
+
+    for (size_t i = 0; i < candCount; ++i) {
+        const XSIfCandidate *c = &cands[i];
+        int score = 0;
+        bool isPref = (strcmp(c->name, pref) == 0);
+        bool isEn = (strncmp(c->name, "en", 2) == 0);
+        if (c->hasIPv4) score += 100;
+        if (c->hasGlobalIPv6) score += 40;
+        else if (c->hasIPv6) score += 20;
+        if (c->linkUp) score += 30;
+        if (isPref && (c->hasIPv4 || c->hasIPv6 || c->linkUp)) score += 80;
+        else if (isPref) score += 10;
+        if (isEn) score += 15;
+        if (c->seenLink) score += 5;
+
+        if (score > bestScore) {
+            bestScore = score;
+            best = c;
+        }
+    }
+
+    if (!best) {
+        return;
+    }
+
+    memcpy(net->primaryIf, best->name, sizeof(net->primaryIf));
+    net->primaryIf[sizeof(net->primaryIf) - 1] = '\0';
+    memcpy(net->ipv4, best->ipv4, sizeof(net->ipv4));
+    net->ipv4[sizeof(net->ipv4) - 1] = '\0';
+    memcpy(net->ipv6, best->ipv6, sizeof(net->ipv6));
+    net->ipv6[sizeof(net->ipv6) - 1] = '\0';
+
+    if (best->seenLink) {
+        uint64_t nowNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        bool sameIf = (strcmp(ctx->prevNetIf, best->name) == 0);
+        if (ctx->hasNetBaseline && sameIf) {
+            double dtSec = (nowNs > ctx->prevNetMonoNs)
+                ? ((double)(nowNs - ctx->prevNetMonoNs) / 1e9)
+                : 0.0;
+            if (dtSec >= 0.05 && dtSec <= 10.0) {
+                if (best->rxBytes >= ctx->prevNetRxBytes) {
+                    net->rxBytesPerSec = (uint64_t)((double)(best->rxBytes - ctx->prevNetRxBytes) / dtSec);
+                }
+                if (best->txBytes >= ctx->prevNetTxBytes) {
+                    net->txBytesPerSec = (uint64_t)((double)(best->txBytes - ctx->prevNetTxBytes) / dtSec);
+                }
+                ctx->prevNetMonoNs = nowNs;
+                ctx->prevNetRxBytes = best->rxBytes;
+                ctx->prevNetTxBytes = best->txBytes;
+            } else if (dtSec > 10.0 || dtSec <= 0.0) {
+                ctx->prevNetMonoNs = nowNs;
+                ctx->prevNetRxBytes = best->rxBytes;
+                ctx->prevNetTxBytes = best->txBytes;
+            }
+        } else {
+            ctx->hasNetBaseline = true;
+            memcpy(ctx->prevNetIf, best->name, sizeof(ctx->prevNetIf));
+            ctx->prevNetMonoNs = nowNs;
+            ctx->prevNetRxBytes = best->rxBytes;
+            ctx->prevNetTxBytes = best->txBytes;
+        }
+    }
+}
+
+/* ========================================================================== *
+ * Dual-Path Process Collector (libsysmon when entitled + libproc fallback)
+ * ========================================================================== */
+
+static uint64_t xs_mach_abs_to_ns(const XSBridgeContext *ctx, uint64_t machTicks) {
+    uint32_t numer = ctx->timebase.numer ? ctx->timebase.numer : 1U;
+    uint32_t denom = ctx->timebase.denom ? ctx->timebase.denom : 1U;
+    if (numer == denom) {
+        return machTicks;
+    }
+    return (uint64_t)(((__uint128_t)machTicks * (__uint128_t)numer) / (__uint128_t)denom);
+}
+
+static bool xs_ensure_proc_buffers(XSBridgeContext *ctx, size_t neededRows) {
+    if (neededRows < 256) {
+        neededRows = 256;
+    }
+    if (neededRows > ctx->procRowCap) {
+        size_t newRowCap = ctx->procRowCap ? ctx->procRowCap : 512;
+        while (newRowCap < neededRows) {
+            newRowCap *= 2;
+        }
+        XSProcRawRow *newRows = (XSProcRawRow *)realloc(ctx->procRowBuf, newRowCap * sizeof(XSProcRawRow));
+        if (!newRows) return false;
+        ctx->procRowBuf = newRows;
+        ctx->procRowCap = newRowCap;
+    }
+
+    size_t minHashCap = 1024;
+    while (minHashCap < neededRows * 2) {
+        minHashCap *= 2;
+    }
+    if (minHashCap > ctx->procTableCap) {
+        XSProcDeltaSlot *newPrev = (XSProcDeltaSlot *)calloc(minHashCap, sizeof(XSProcDeltaSlot));
+        XSProcDeltaSlot *newCurr = (XSProcDeltaSlot *)calloc(minHashCap, sizeof(XSProcDeltaSlot));
+        if (!newPrev || !newCurr) {
+            free(newPrev);
+            free(newCurr);
+            return false;
+        }
+        /* Rehash existing prevProcTable so resizing never drops active delta baselines */
+        if (ctx->prevProcTable && ctx->procTableCap > 0) {
+            size_t mask = minHashCap - 1;
+            for (size_t i = 0; i < ctx->procTableCap; ++i) {
+                if (ctx->prevProcTable[i].pid > 0) {
+                    size_t idx = ((uint32_t)ctx->prevProcTable[i].pid * 2654435761U) & mask;
+                    while (newPrev[idx].pid != 0) {
+                        idx = (idx + 1) & mask;
+                    }
+                    newPrev[idx] = ctx->prevProcTable[i];
+                }
+            }
+        }
+        free(ctx->prevProcTable);
+        free(ctx->currProcTable);
+        ctx->prevProcTable = newPrev;
+        ctx->currProcTable = newCurr;
+        ctx->procTableCap = minHashCap;
+    }
+    return true;
+}
+
+static bool xs_proc_hash_lookup(
+    const XSProcDeltaSlot *table,
+    size_t cap,
+    int32_t pid,
+    uint64_t startKey,
+    uint64_t *outCpuNs)
+{
+    if (!table || cap == 0 || pid <= 0) return false;
+    size_t mask = cap - 1;
+    size_t idx = ((uint32_t)pid * 2654435761U) & mask;
+    for (size_t step = 0; step < cap; ++step) {
+        const XSProcDeltaSlot *s = &table[idx];
+        if (s->pid == 0) {
+            return false;
+        }
+        if (s->pid == pid) {
+            if (s->startKey == startKey) {
+                *outCpuNs = s->cpuNs;
+                return true;
+            }
+            return false;
+        }
+        idx = (idx + 1) & mask;
+    }
+    return false;
+}
+
+static bool xs_proc_hash_insert_unique(
+    XSProcDeltaSlot *table,
+    size_t cap,
+    int32_t pid,
+    uint64_t startKey,
+    uint64_t cpuNs)
+{
+    if (!table || cap == 0 || pid <= 0) return false;
+    size_t mask = cap - 1;
+    size_t idx = ((uint32_t)pid * 2654435761U) & mask;
+    for (size_t step = 0; step < cap; ++step) {
+        XSProcDeltaSlot *s = &table[idx];
+        if (s->pid == 0) {
+            s->pid = pid;
+            s->startKey = startKey;
+            s->cpuNs = cpuNs;
+            return true;
+        }
+        if (s->pid == pid) {
+            return false; /* Duplicate PID in snapshot */
+        }
+        idx = (idx + 1) & mask;
+    }
+    return false;
+}
+
+static int xs_compare_proc_rows(const void *a, const void *b) {
+    const XSProcRawRow *pa = (const XSProcRawRow *)a;
+    const XSProcRawRow *pb = (const XSProcRawRow *)b;
+    if (pa->cpuPct > pb->cpuPct) return -1;
+    if (pa->cpuPct < pb->cpuPct) return 1;
+    if (pa->memoryBytes > pb->memoryBytes) return -1;
+    if (pa->memoryBytes < pb->memoryBytes) return 1;
+    if (pa->pid < pb->pid) return -1;
+    if (pa->pid > pb->pid) return 1;
+    return 0;
+}
+
+static void xs_probe_sysmon(XSBridgeContext *ctx) {
+    if (ctx->sysmonProbed) {
+        return;
+    }
+    ctx->sysmonProbed = true;
+    ctx->hasSysmonEntitlement = false;
+
+    /* Check SecTaskCopyValueForEntitlement BEFORE touching libsysmon XPC */
+    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    if (!task) {
+        return;
+    }
+    CFTypeRef ent = SecTaskCopyValueForEntitlement(
+        task, CFSTR("com.apple.private.sysmond.client"), NULL);
+    if (ent) {
+        if (CFGetTypeID(ent) == CFBooleanGetTypeID() &&
+            CFBooleanGetValue((CFBooleanRef)ent)) {
+            ctx->hasSysmonEntitlement = true;
+        }
+        CFRelease(ent);
+    }
+    CFRelease(task);
+
+    if (!ctx->hasSysmonEntitlement) {
+        return;
+    }
+
+    ctx->sysmonDylib = dlopen("/usr/lib/libsysmon.dylib", RTLD_LAZY);
+    if (!ctx->sysmonDylib) {
+        ctx->hasSysmonEntitlement = false;
+        return;
+    }
+
+    ctx->pSysmonReqCreate = (fn_sysmon_request_create)dlsym(ctx->sysmonDylib, "sysmon_request_create");
+    ctx->pSysmonReqAddAttr = (fn_sysmon_request_add_attribute)dlsym(ctx->sysmonDylib, "sysmon_request_add_attribute");
+    ctx->pSysmonReqExecute = (fn_sysmon_request_execute)dlsym(ctx->sysmonDylib, "sysmon_request_execute");
+    ctx->pSysmonReqCancel = (fn_sysmon_request_cancel)dlsym(ctx->sysmonDylib, "sysmon_request_cancel");
+    ctx->pSysmonTableApply = (fn_sysmon_table_apply)dlsym(ctx->sysmonDylib, "sysmon_table_apply");
+    ctx->pSysmonRowGetValue = (fn_sysmon_row_get_value)dlsym(ctx->sysmonDylib, "sysmon_row_get_value");
+    ctx->pSysmonRelease = (fn_sysmon_release)dlsym(ctx->sysmonDylib, "sysmon_release");
+
+    if (!ctx->pSysmonReqCreate || !ctx->pSysmonReqAddAttr || !ctx->pSysmonReqExecute ||
+        !ctx->pSysmonTableApply || !ctx->pSysmonRowGetValue || !ctx->pSysmonRelease) {
+        dlclose(ctx->sysmonDylib);
+        ctx->sysmonDylib = NULL;
+        ctx->hasSysmonEntitlement = false;
+    }
+}
+
+typedef struct {
+    os_unfair_lock lock;
+    int refCount;
+    bool abandoned;
+    dispatch_semaphore_t sem;
+    XSProcRawRow *rows;
+    size_t count;
+    size_t cap;
+} XSSysmonBatchState;
+
+static void xs_sysmon_batch_release(XSSysmonBatchState *st) {
+    os_unfair_lock_lock(&st->lock);
+    int rem = --st->refCount;
+    os_unfair_lock_unlock(&st->lock);
+    if (rem == 0) {
+        if (st->sem) {
+            dispatch_release(st->sem);
+        }
+        free(st->rows);
+        free(st);
+    }
+}
+
+static uint64_t xs_xpc_u64_or(xpc_object_t obj, uint64_t fallback) {
+    if (!obj) return fallback;
+    xpc_type_t t = xpc_get_type(obj);
+    if (t == XPC_TYPE_UINT64) return xpc_uint64_get_value(obj);
+    if (t == XPC_TYPE_INT64) {
+        int64_t v = xpc_int64_get_value(obj);
+        return (v > 0) ? (uint64_t)v : 0ULL;
+    }
+    return fallback;
+}
+
+static size_t xs_collect_rows_sysmon(XSBridgeContext *ctx) {
+    if (!ctx->hasSysmonEntitlement || !ctx->sysmonDylib) {
+        return 0;
+    }
+
+    XSSysmonBatchState *st = (XSSysmonBatchState *)calloc(1, sizeof(XSSysmonBatchState));
+    if (!st) return 0;
+    st->lock = OS_UNFAIR_LOCK_INIT;
+    st->refCount = 2; /* 1 caller + 1 callback */
+    st->sem = dispatch_semaphore_create(0);
+    if (!st->sem) {
+        free(st);
+        return 0;
+    }
+
+    fn_sysmon_table_apply pTableApply = ctx->pSysmonTableApply;
+    fn_sysmon_row_get_value pRowGetVal = ctx->pSysmonRowGetValue;
+
+    xs_sysmon_request_t req = ctx->pSysmonReqCreate(XS_SYSMON_REQ_PROCESS, ^(xs_sysmon_table_t table) {
+        os_unfair_lock_lock(&st->lock);
+        bool skip = st->abandoned;
+        os_unfair_lock_unlock(&st->lock);
+
+        if (!skip && table != NULL) {
+            pTableApply(table, ^bool(xs_sysmon_row_t row) {
+                uint64_t pidU = xs_xpc_u64_or(pRowGetVal(row, XS_SYSMON_ATTR_PID), 0);
+                if (pidU == 0) return true;
+
+                XSProcRawRow r;
+                memset(&r, 0, sizeof(r));
+                r.pid = (int32_t)pidU;
+                r.uid = (uint32_t)xs_xpc_u64_or(pRowGetVal(row, XS_SYSMON_ATTR_UID), 0);
+                r.startKey = xs_xpc_u64_or(pRowGetVal(row, XS_SYSMON_ATTR_START_NS), pidU);
+                uint64_t userNs = xs_xpc_u64_or(pRowGetVal(row, XS_SYSMON_ATTR_USER_NS), 0);
+                uint64_t sysNs = xs_xpc_u64_or(pRowGetVal(row, XS_SYSMON_ATTR_SYS_NS), 0);
+                r.cpuNs = userNs + sysNs;
+                uint64_t fp = xs_xpc_u64_or(pRowGetVal(row, XS_SYSMON_ATTR_FOOTPRINT), 0);
+                if (fp == 0) {
+                    fp = xs_xpc_u64_or(pRowGetVal(row, XS_SYSMON_ATTR_RESIDENT), 0);
+                }
+                r.memoryBytes = fp;
+
+                xpc_object_t nameObj = pRowGetVal(row, XS_SYSMON_ATTR_NAME);
+                const char *s = (nameObj && xpc_get_type(nameObj) == XPC_TYPE_STRING)
+                    ? xpc_string_get_string_ptr(nameObj)
+                    : NULL;
+                if (!s || s[0] == '\0') {
+                    xpc_object_t commObj = pRowGetVal(row, XS_SYSMON_ATTR_COMM);
+                    s = (commObj && xpc_get_type(commObj) == XPC_TYPE_STRING)
+                        ? xpc_string_get_string_ptr(commObj)
+                        : NULL;
+                }
+                if (s && s[0] != '\0') {
+                    strncpy(r.name, s, sizeof(r.name) - 1);
+                    r.name[sizeof(r.name) - 1] = '\0';
+                }
+
+                os_unfair_lock_lock(&st->lock);
+                if (!st->abandoned) {
+                    if (st->count >= st->cap) {
+                        size_t newCap = st->cap ? (st->cap * 2) : 512;
+                        XSProcRawRow *nr = (XSProcRawRow *)realloc(st->rows, newCap * sizeof(XSProcRawRow));
+                        if (nr) {
+                            st->rows = nr;
+                            st->cap = newCap;
+                        }
+                    }
+                    if (st->count < st->cap) {
+                        st->rows[st->count++] = r;
+                    }
+                }
+                os_unfair_lock_unlock(&st->lock);
+                return true;
+            });
+        }
+
+        dispatch_semaphore_signal(st->sem);
+        xs_sysmon_batch_release(st);
+    });
+
+    if (!req) {
+        st->refCount = 1;
+        xs_sysmon_batch_release(st);
+        return 0;
+    }
+
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_PID);
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_UID);
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_COMM);
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_NAME);
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_START_NS);
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_USER_NS);
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_SYS_NS);
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_FOOTPRINT);
+    ctx->pSysmonReqAddAttr(req, XS_SYSMON_ATTR_RESIDENT);
+
+    ctx->pSysmonReqExecute(req);
+    long waitRes = dispatch_semaphore_wait(
+        st->sem, dispatch_time(DISPATCH_TIME_NOW, 300LL * (int64_t)NSEC_PER_MSEC));
+
+    size_t copied = 0;
+    os_unfair_lock_lock(&st->lock);
+    if (waitRes != 0) {
+        st->abandoned = true;
+    } else if (st->count > 0 && xs_ensure_proc_buffers(ctx, st->count)) {
+        memcpy(ctx->procRowBuf, st->rows, st->count * sizeof(XSProcRawRow));
+        copied = st->count;
+    }
+    os_unfair_lock_unlock(&st->lock);
+
+    if (waitRes != 0 && ctx->pSysmonReqCancel) {
+        ctx->pSysmonReqCancel(req);
+    }
+    ctx->pSysmonRelease(req);
+    xs_sysmon_batch_release(st);
+    return copied;
+}
+
+static size_t xs_collect_rows_libproc(XSBridgeContext *ctx) {
+    /* Note: proc_listallpids() takes buffer size in bytes, and returns the NUMBER of PIDs. */
+    int estPids = proc_listallpids(NULL, 0);
+    if (estPids <= 0) {
+        return 0;
+    }
+    size_t needPids = (size_t)estPids + 256;
+    if (needPids > ctx->pidBufCap) {
+        int *newBuf = (int *)realloc(ctx->pidBuf, needPids * sizeof(int));
+        if (!newBuf) return 0;
+        ctx->pidBuf = newBuf;
+        ctx->pidBufCap = needPids;
+    }
+
+    int actualPids = proc_listallpids(ctx->pidBuf, (int)(ctx->pidBufCap * sizeof(int)));
+    if (actualPids <= 0) {
+        return 0;
+    }
+    size_t pidCount = ((size_t)actualPids <= ctx->pidBufCap) ? (size_t)actualPids : ctx->pidBufCap;
+    if (!xs_ensure_proc_buffers(ctx, pidCount)) {
+        return 0;
+    }
+
+    size_t outCount = 0;
+    for (size_t i = 0; i < pidCount; ++i) {
+        int pid = ctx->pidBuf[i];
+        if (pid <= 0) continue;
+
+        struct proc_bsdinfo bsd;
+        if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, (int)sizeof(bsd)) != (int)sizeof(bsd)) {
+            continue;
+        }
+
+        struct rusage_info_v4 ru;
+        memset(&ru, 0, sizeof(ru));
+        if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&ru) != 0) {
+            continue;
+        }
+
+        XSProcRawRow *r = &ctx->procRowBuf[outCount++];
+        memset(r, 0, sizeof(*r));
+        r->pid = (int32_t)pid;
+        r->uid = (uint32_t)bsd.pbi_uid;
+        r->startKey = ((uint64_t)bsd.pbi_start_tvsec << 20) ^
+                      ((uint64_t)bsd.pbi_start_tvusec & 0xFFFFFULL);
+        r->cpuNs = xs_mach_abs_to_ns(ctx, ru.ri_user_time + ru.ri_system_time);
+        r->memoryBytes = (ru.ri_phys_footprint > 0) ? ru.ri_phys_footprint : ru.ri_resident_size;
+
+        const char *rawName = (bsd.pbi_name[0] != '\0') ? bsd.pbi_name : bsd.pbi_comm;
+        strncpy(r->name, rawName, sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+    }
+    return outCount;
+}
+
+/* ========================================================================== *
  * Public Lifecycle & Core Sampling Entry Points
  * ========================================================================== */
 
@@ -933,6 +1897,12 @@ XSBridgeContext *xs_bridge_create(void) {
     }
 
     ctx->hostPort = mach_host_self();
+    (void)mach_timebase_info(&ctx->timebase);
+    if (ctx->timebase.numer == 0 || ctx->timebase.denom == 0) {
+        ctx->timebase.numer = 1;
+        ctx->timebase.denom = 1;
+    }
+    memcpy(ctx->preferredNetIf, "en1", 4);
 
     uint64_t memsize = 0;
     size_t memLen = sizeof(memsize);
@@ -970,6 +1940,24 @@ void xs_bridge_reset_baselines(XSBridgeContext *ctx) {
     ctx->gpuFreqState.freqProbed = false;
     ctx->gpuFreqState.supportsGpuFreq = false;
     ctx->s0ixCacheValid = false;
+    ctx->hasDiskBaseline = false;
+    ctx->hasNetBaseline = false;
+    ctx->hasProcBaseline = false;
+    if (ctx->prevProcTable && ctx->procTableCap > 0) {
+        memset(ctx->prevProcTable, 0, ctx->procTableCap * sizeof(XSProcDeltaSlot));
+    }
+}
+
+void xs_bridge_set_preferred_net_if(XSBridgeContext *ctx, const char *ifName) {
+    if (!ctx) {
+        return;
+    }
+    if (!ifName || ifName[0] == '\0') {
+        memcpy(ctx->preferredNetIf, "en1", 4);
+        return;
+    }
+    strncpy(ctx->preferredNetIf, ifName, sizeof(ctx->preferredNetIf) - 1);
+    ctx->preferredNetIf[sizeof(ctx->preferredNetIf) - 1] = '\0';
 }
 
 void xs_bridge_sample_core(
@@ -1124,9 +2112,170 @@ void xs_bridge_sample_core(
     if (pwr) *pwr = localPwr;
 }
 
+void xs_bridge_sample_io_net(
+    XSBridgeContext *ctx,
+    bool refreshSmart,
+    XSStorageMetrics *sto,
+    XSNetworkMetrics *net)
+{
+    XSStorageMetrics localSto;
+    XSNetworkMetrics localNet;
+    memset(&localSto, 0, sizeof(localSto));
+    memset(&localNet, 0, sizeof(localNet));
+
+    if (!ctx) {
+        if (sto) *sto = localSto;
+        if (net) *net = localNet;
+        return;
+    }
+
+    xs_sample_storage(ctx, refreshSmart, &localSto);
+    xs_sample_network(ctx, &localNet);
+
+    if (sto) *sto = localSto;
+    if (net) *net = localNet;
+}
+
+uint32_t xs_bridge_sample_processes(
+    XSBridgeContext *ctx,
+    XSProcessEntry *outEntries,
+    uint32_t maxEntries,
+    bool *outAllUsers)
+{
+    if (outAllUsers) {
+        *outAllUsers = false;
+    }
+    if (!ctx || !outEntries || maxEntries == 0) {
+        return 0;
+    }
+
+    xs_probe_sysmon(ctx);
+
+    uint64_t nowNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    size_t rawCount = 0;
+    bool allUsers = false;
+
+    if (ctx->hasSysmonEntitlement) {
+        rawCount = xs_collect_rows_sysmon(ctx);
+        if (rawCount > 0) {
+            allUsers = true;
+        }
+    }
+    if (rawCount == 0) {
+        rawCount = xs_collect_rows_libproc(ctx);
+        allUsers = false;
+    }
+    if (outAllUsers) {
+        *outAllUsers = allUsers;
+    }
+    if (rawCount == 0 || !ctx->currProcTable || ctx->procTableCap == 0) {
+        return 0;
+    }
+
+    memset(ctx->currProcTable, 0, ctx->procTableCap * sizeof(XSProcDeltaSlot));
+
+    uint64_t dtNs = (ctx->hasProcBaseline && nowNs > ctx->prevProcMonoNs)
+        ? (nowNs - ctx->prevProcMonoNs)
+        : 0ULL;
+    bool validDeltaWindow = ctx->hasProcBaseline &&
+                            dtNs >= 20000000ULL &&
+                            dtNs <= 10000000000ULL;
+
+    size_t uniqueCount = 0;
+    for (size_t i = 0; i < rawCount; ++i) {
+        XSProcRawRow r = ctx->procRowBuf[i];
+        if (r.pid <= 0) continue;
+
+        if (!xs_proc_hash_insert_unique(
+                ctx->currProcTable, ctx->procTableCap, r.pid, r.startKey, r.cpuNs)) {
+            continue;
+        }
+
+        double cpuPct = 0.0;
+        if (validDeltaWindow) {
+            uint64_t prevCpuNs = 0;
+            if (xs_proc_hash_lookup(
+                    ctx->prevProcTable, ctx->procTableCap, r.pid, r.startKey, &prevCpuNs) &&
+                r.cpuNs >= prevCpuNs) {
+                cpuPct = ((double)(r.cpuNs - prevCpuNs) / (double)dtNs) * 100.0;
+                if (cpuPct < 0.0) cpuPct = 0.0;
+                if (cpuPct > 1600.0) cpuPct = 1600.0;
+            }
+        }
+        r.cpuPct = cpuPct;
+        ctx->procRowBuf[uniqueCount++] = r;
+    }
+
+    /* Swap double-buffered PID tables so dead PIDs are evicted in O(1) with zero leaks */
+    if (!ctx->hasProcBaseline || dtNs >= 20000000ULL || dtNs > 10000000000ULL) {
+        XSProcDeltaSlot *tmp = ctx->prevProcTable;
+        ctx->prevProcTable = ctx->currProcTable;
+        ctx->currProcTable = tmp;
+        ctx->prevProcMonoNs = nowNs;
+        ctx->hasProcBaseline = true;
+    }
+
+    if (uniqueCount > 1) {
+        qsort(ctx->procRowBuf, uniqueCount, sizeof(XSProcRawRow), xs_compare_proc_rows);
+    }
+
+    uint32_t outCount = (uniqueCount < (size_t)maxEntries) ? (uint32_t)uniqueCount : maxEntries;
+    for (uint32_t i = 0; i < outCount; ++i) {
+        const XSProcRawRow *src = &ctx->procRowBuf[i];
+        XSProcessEntry dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.pid = src->pid;
+        dst.uid = src->uid;
+        dst.cpuPct = src->cpuPct;
+        dst.memoryBytes = src->memoryBytes;
+
+        memcpy(dst.name, src->name, sizeof(dst.name));
+        dst.name[sizeof(dst.name) - 1] = '\0';
+
+        /* If pbi_name was empty or truncated near 2*MAXCOMLEN-1, try executable basename */
+        if (dst.name[0] == '\0' || strlen(dst.name) >= 31) {
+            char pathBuf[PROC_PIDPATHINFO_MAXSIZE];
+            int pathLen = proc_pidpath(src->pid, pathBuf, sizeof(pathBuf));
+            if (pathLen > 0) {
+                pathBuf[sizeof(pathBuf) - 1] = '\0';
+                const char *slash = strrchr(pathBuf, '/');
+                const char *base = slash ? (slash + 1) : pathBuf;
+                if (base[0] != '\0') {
+                    strncpy(dst.name, base, sizeof(dst.name) - 1);
+                    dst.name[sizeof(dst.name) - 1] = '\0';
+                }
+            }
+        }
+        if (dst.name[0] == '\0') {
+            memcpy(dst.name, "unknown", 8);
+        }
+
+        outEntries[i] = dst;
+    }
+
+    return outCount;
+}
+
 void xs_bridge_destroy(XSBridgeContext *ctx) {
     if (!ctx) {
         return;
+    }
+
+    if (ctx->nvmeSmartIf) {
+        (*ctx->nvmeSmartIf)->Release(ctx->nvmeSmartIf);
+        ctx->nvmeSmartIf = NULL;
+    }
+    if (ctx->nvmePlugIn) {
+        IODestroyPlugInInterface(ctx->nvmePlugIn);
+        ctx->nvmePlugIn = NULL;
+    }
+    if (ctx->blockDriverService != IO_OBJECT_NULL) {
+        IOObjectRelease(ctx->blockDriverService);
+        ctx->blockDriverService = IO_OBJECT_NULL;
+    }
+    if (ctx->nvmeBlockService != IO_OBJECT_NULL) {
+        IOObjectRelease(ctx->nvmeBlockService);
+        ctx->nvmeBlockService = IO_OBJECT_NULL;
     }
 
     if (ctx->ioSub) {
@@ -1169,6 +2318,15 @@ void xs_bridge_destroy(XSBridgeContext *ctx) {
         dlclose(ctx->ioReportDylib);
         ctx->ioReportDylib = NULL;
     }
+    if (ctx->sysmonDylib) {
+        dlclose(ctx->sysmonDylib);
+        ctx->sysmonDylib = NULL;
+    }
+
+    free(ctx->prevProcTable);
+    free(ctx->currProcTable);
+    free(ctx->pidBuf);
+    free(ctx->procRowBuf);
 
     free(ctx);
 }

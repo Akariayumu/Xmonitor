@@ -55,8 +55,9 @@ func expectApprox(
 }
 
 @main
+@MainActor
 struct XSenseiTestRunner {
-    static func main() async {
+    static func main() {
         var failures: [String] = []
 
         do {
@@ -64,6 +65,15 @@ struct XSenseiTestRunner {
             print("[PASS] All BridgeCoreTests passed")
         } catch {
             let desc = "[FAIL] BridgeCoreTests: \(error)"
+            fputs("\(desc)\n", stderr)
+            failures.append(desc)
+        }
+
+        do {
+            try runEngineAndCollectorsTests()
+            print("[PASS] All EngineAndCollectorsTests passed")
+        } catch {
+            let desc = "[FAIL] EngineAndCollectorsTests: \(error)"
             fputs("\(desc)\n", stderr)
             failures.append(desc)
         }

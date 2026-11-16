@@ -1,0 +1,104 @@
+#!/bin/bash
+# 在 macOS 上编译并打包 XSensei：build/XSensei.app
+# 用法：scripts/build-app.sh [--install]   --install 复制到 /Applications 并启动
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+APP=build/XSensei.app
+VERSION=$(git describe --tags --always 2>/dev/null || echo 0.1.0)
+CERT_NAME="XSensei Dev"
+TARGET="x86_64-apple-macos14.0"
+
+if [[ -z "${SIGN_IDENTITY:-}" ]]; then
+    if security find-identity -p codesigning 2>/dev/null | grep -q "\"$CERT_NAME\""; then
+        SIGN_IDENTITY="$CERT_NAME"
+    else
+        SIGN_IDENTITY="-"
+        echo "==> 未找到证书 \"$CERT_NAME\"，使用临时签名 (-)"
+    fi
+fi
+
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" build
+
+echo "==> 编译 C 采集桥接层 (HardwareBridge.c)"
+clang -O3 -Wall -Wextra -std=c11 \
+    -target "$TARGET" \
+    -c Sources/Bridge/HardwareBridge.c \
+    -o build/HardwareBridge.o
+
+SWIFT_SOURCES=()
+while IFS= read -r file; do
+    SWIFT_SOURCES+=("$file")
+done < <(find Sources -name '*.swift' | sort)
+
+echo "==> 编译 Swift 应用主体 (${#SWIFT_SOURCES[@]} files)"
+swiftc -O -swift-version 5 -parse-as-library \
+    -target "$TARGET" \
+    -import-objc-header Sources/Bridge/HardwareBridge.h \
+    "${SWIFT_SOURCES[@]}" \
+    build/HardwareBridge.o \
+    -framework AppKit \
+    -framework SwiftUI \
+    -framework IOKit \
+    -framework CoreFoundation \
+    -framework CoreWLAN \
+    -framework ServiceManagement \
+    -o "$APP/Contents/MacOS/XSensei"
+
+cat > "$APP/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.xstation.sensei</string>
+    <key>CFBundleName</key>
+    <string>XSensei</string>
+    <key>CFBundleDisplayName</key>
+    <string>XSensei</string>
+    <key>CFBundleExecutable</key>
+    <string>XSensei</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION}</string>
+    <key>CFBundleVersion</key>
+    <string>${VERSION}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+ENTITLEMENTS_FILE="Resources/XSensei.entitlements"
+if [[ "${ENABLE_SYSMOND_ENTITLEMENT:-0}" == "1" ]]; then
+    ENTITLEMENTS_FILE="build/XSensei.sysmond.entitlements"
+    cat > "$ENTITLEMENTS_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.private.sysmond.client</key>
+    <true/>
+</dict>
+</plist>
+EOF
+fi
+
+codesign --force --sign "$SIGN_IDENTITY" \
+    --entitlements "$ENTITLEMENTS_FILE" \
+    "$APP"
+echo "==> ${APP}（签名：${SIGN_IDENTITY}，权限文件：${ENTITLEMENTS_FILE}）"
+
+if [[ "${1:-}" == "--install" ]]; then
+    pkill -x XSensei 2>/dev/null || true
+    rm -rf /Applications/XSensei.app
+    cp -R "$APP" /Applications/
+    open /Applications/XSensei.app
+    echo "==> 已安装并启动 /Applications/XSensei.app"
+fi

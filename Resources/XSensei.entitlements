@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Note: Embedding com.apple.private.sysmond.client on self-signed / ad-hoc binaries
+  triggers AMFI Code=-413 ("No matching profile found") SIGKILL at execve on Sequoia
+  unless boot-args include amfi=0x80 (AMFIPass 1.4.1 under SIP=0x803 only exempts
+  OCLP-patched system binaries). Default <dict/> lets XSensei run cleanly on live
+  EFI v2.0 using the <libproc.h> process fallback; set ENABLE_SYSMOND_ENTITLEMENT=1
+  when building for an amfi=0x80 environment.
+-->
+<dict/>
+</plist>

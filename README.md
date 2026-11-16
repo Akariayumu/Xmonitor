@@ -6,6 +6,21 @@
 
 ---
 
+## 实机界面预览（X-STATION V2 · macOS Sequoia 15.8.1）
+
+### 顶部同色菜单栏 · 速览弹窗 · 壁纸层常驻小组件
+![顶部菜单栏、速览面板与壁纸层小组件](docs/screenshots/menubar-and-widgets.png)
+
+### 主控制台 · 全景概览与 S0ix 现代待机专属诊断
+| 全景概览 (`Overview`) | 电源与 S0ix 深度待机诊断 (`CC7/PC8 99% · 真 DC9`) |
+| :---: | :---: |
+| ![主控制台总览面板](docs/screenshots/console-overview.png) | ![电源与 S0ix 诊断面板](docs/screenshots/console-power-s0ix.png) |
+
+### 外观主题 · 采样频率 · 菜单栏样式与模块顺序自定义
+![自定义偏好设置面板](docs/screenshots/console-settings.png)
+
+---
+
 ## 核心特性
 
 ### 1. 三端一体 · 单源驱动 (`TelemetryEngine`)

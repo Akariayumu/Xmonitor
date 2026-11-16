@@ -51,15 +51,27 @@ func runEngineAndCollectorsTests() throws {
     try expectEqual(store.showMenuRAM, true, "default showMenuRAM")
     try expectEqual(store.showMenuPower, true, "default showMenuPower")
     try expectEqual(store.showMenuNet, false, "default showMenuNet")
-    try expectEqual(store.showMenuTemp, false, "default showMenuTemp")
+    try expectEqual(store.showMenuTemp, true, "default showMenuTemp")
+    try expectEqual(store.menuBarStyle, MenuBarLayoutStyle.stacked, "default menuBarStyle")
+    try expectEqual(store.showMenuCpuFreq, true, "default showMenuCpuFreq")
+    try expectEqual(store.showMenuDividers, true, "default showMenuDividers")
+    try expectApprox(store.ambientRefreshInterval, 2.0, tol: 1e-6, "default ambientRefreshInterval")
     try expectEqual(store.widgetsLocked, true, "default widgetsLocked")
     try expectApprox(store.widgetOpacity, 0.88, tol: 1e-6, "default widgetOpacity")
     store.themeMode = .lightFrost
+    store.menuBarStyle = .inline
+    store.showMenuCpuFreq = false
+    store.ambientRefreshInterval = 1.0
+    store.moveMenuModule(.power, by: -1)
     store.showMenuNet = true
     store.widgetsLocked = false
     store.widgetOpacity = 0.75
     let reloadedStore = SettingsStore(defaults: defaults)
     try expectEqual(reloadedStore.themeMode, AppThemeMode.lightFrost, "persisted themeMode")
+    try expectEqual(reloadedStore.menuBarStyle, MenuBarLayoutStyle.inline, "persisted menuBarStyle")
+    try expectEqual(reloadedStore.showMenuCpuFreq, false, "persisted showMenuCpuFreq")
+    try expectApprox(reloadedStore.ambientRefreshInterval, 1.0, tol: 1e-6, "persisted ambientRefreshInterval")
+    try expectEqual(reloadedStore.menuModuleOrder[3], MenuBarModule.power, "persisted menuModuleOrder move")
     try expectEqual(reloadedStore.showMenuNet, true, "persisted showMenuNet")
     try expectEqual(reloadedStore.widgetsLocked, false, "persisted widgetsLocked")
     try expectApprox(reloadedStore.widgetOpacity, 0.75, tol: 1e-6, "persisted widgetOpacity")
@@ -137,7 +149,7 @@ func runEngineAndCollectorsTests() throws {
         )
     } else {
         try expectTrue(
-            fullCount >= 5 && fullNames.contains("XSenseiTests"),
+            fullCount >= 5 && (fullNames.contains("XmonitorTests") || fullNames.contains("XSenseiTests")),
             "headless PID scan includes current user processes (count=\(fullCount))"
         )
     }

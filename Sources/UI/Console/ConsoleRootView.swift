@@ -267,19 +267,25 @@ struct ConsoleRootView: View {
 
     private var sidebarBrandHeader: some View {
         HStack(spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(SenseiAccent.cyan.gradient)
-                    .frame(width: 34, height: 34)
-                    .shadow(color: SenseiAccent.cyan.primaryColor.opacity(0.32), radius: 6, x: 0, y: 2)
-                Image(systemName: "gauge.with.dots.needle.67percent")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.white)
+            if let appIcon = NSApp?.applicationIconImage, appIcon.size.width > 0 {
+                Image(nsImage: appIcon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 36, height: 36)
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(SenseiAccent.cyan.gradient)
+                        .frame(width: 34, height: 34)
+                    Image(systemName: "gauge.with.dots.needle.67percent")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.white)
+                }
             }
 
             VStack(alignment: .leading, spacing: 1.5) {
                 HStack(spacing: 5) {
-                    Text("XSensei")
+                    Text("Xmonitor")
                         .font(.system(size: 14.5, weight: .bold))
                     Text("v2.0")
                         .font(.system(size: 10, weight: .bold))
@@ -330,7 +336,11 @@ struct ConsoleRootView: View {
                 .frame(width: 7, height: 7)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(engine.currentInterval <= 1.1 ? "1.0s 高速交互采样" : "2.0s 常驻节能采样")
+                Text(
+                    engine.currentInterval <= 1.1
+                        ? "1.0s 高速交互采样"
+                        : String(format: "%.1fs 常驻节能采样", engine.currentInterval)
+                )
                     .font(.system(size: 11, weight: .semibold))
                     .monospacedDigit()
                 Text("S0ix 零唤醒保护已启用")

@@ -11,6 +11,7 @@ struct MenuPopoverView: View {
     @ObservedObject var settings: SettingsStore
     @ObservedObject var widgetManager: DesktopWidgetManager
     let onOpenConsole: () -> Void
+    var onOpenSettings: () -> Void = {}
     let onClosePopover: () -> Void
 
     private var snap: SystemSnapshot { engine.snapshot }
@@ -41,9 +42,9 @@ struct MenuPopoverView: View {
                     Circle()
                         .fill(SenseiAccent.cyan.primaryColor)
                         .frame(width: 6.5, height: 6.5)
-                    Text("X-STATION V2")
-                        .font(.system(size: 11, weight: .bold))
-                        .tracking(0.5)
+                    Text("Xmonitor")
+                        .font(.system(size: 11.5, weight: .bold))
+                        .tracking(0.3)
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3.5)
@@ -57,6 +58,37 @@ struct MenuPopoverView: View {
 
                 Spacer(minLength: 4)
 
+                Menu {
+                    Section("顶部菜单栏样式") {
+                        ForEach(MenuBarLayoutStyle.allCases, id: \.rawValue) { style in
+                            Button {
+                                settings.menuBarStyle = style
+                            } label: {
+                                HStack {
+                                    Text(style.displayTitle)
+                                    if settings.menuBarStyle == style {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("打开自定义偏好设置…") {
+                        onClosePopover()
+                        onOpenSettings()
+                    }
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .background(Color.primary.opacity(0.07), in: Circle())
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("快速切换菜单栏样式与打开自定义设置")
+
                 Button {
                     NSApplication.shared.terminate(nil)
                 } label: {
@@ -67,7 +99,7 @@ struct MenuPopoverView: View {
                         .background(Color.primary.opacity(0.07), in: Circle())
                 }
                 .buttonStyle(.plain)
-                .help("退出 XSensei")
+                .help("退出 Xmonitor")
             }
 
             HStack(spacing: 6) {

@@ -1,5 +1,24 @@
+import Darwin
 import Foundation
 import SwiftUI
+
+private enum KernelVMFeatures {
+    static let compressorMode: Int32 = {
+        var val: Int32 = 0
+        var sz = MemoryLayout<Int32>.size
+        return sysctlbyname("vm.compressor_mode", &val, &sz, nil, 0) == 0 ? val : 0
+    }()
+
+    static let hvSupport: Bool = {
+        var val: Int32 = 0
+        var sz = MemoryLayout<Int32>.size
+        return sysctlbyname("kern.hv_support", &val, &sz, nil, 0) == 0 && val != 0
+    }()
+
+    static var swapEnabled: Bool {
+        compressorMode >= 4
+    }
+}
 
 private struct MemoryBreakdownDonut: View {
     let totalBytes: UInt64
@@ -260,34 +279,58 @@ struct MemoryDetailView: View {
         let swapFree = mem.swapTotalBytes > mem.swapUsedBytes
             ? (mem.swapTotalBytes - mem.swapUsedBytes)
             : 0
+        let swapEnabled = KernelVMFeatures.swapEnabled
+        let hvSupported = KernelVMFeatures.hvSupport
+
+        let badgeText: String
+        if mem.swapUsedBytes > 0 {
+            badgeText = ConsoleFormat.percent1(swapPct)
+        } else if swapEnabled {
+            badgeText = "已开启 · 按需分配"
+        } else {
+            badgeText = "未开启"
+        }
 
         return GlassCard(padding: 16, cornerRadius: 16, opacity: settings.widgetOpacity) {
             VStack(alignment: .leading, spacing: 12) {
                 ConsoleSectionHeader(
-                    title: "虚拟内存交换区 (VM Swap)",
-                    subtitle: "sysctl vm.swapusage 动态加密交换文件",
+                    title: "虚拟内存交换与硬件虚拟化 (VM / Swap)",
+                    subtitle: "vm.compressor_mode=\(KernelVMFeatures.compressorMode) 加密按需交换 · Hypervisor VT-x",
                     icon: "arrow.left.arrow.right.circle.fill",
                     accent: mem.swapUsedBytes == 0 ? .emerald : .amber,
-                    trailingBadge: mem.swapUsedBytes == 0 ? "零交换写入" : ConsoleFormat.percent1(swapPct)
+                    trailingBadge: badgeText
                 )
 
                 HStack(spacing: 18) {
                     RingGauge(
                         progress: swapPct / 100.0,
                         valueText: mem.swapTotalBytes > 0 ? ConsoleFormat.percentInt(swapPct) : "0%",
-                        subtitle: "Swap",
+                        subtitle: swapEnabled ? "按需就绪" : "Swap",
                         accent: mem.swapUsedBytes == 0 ? .emerald : .amber,
                         size: 84,
                         lineWidth: 7.5
                     )
 
-                    VStack(alignment: .leading, spacing: 7) {
-                        ConsoleStatRow(label: "已使用 Swap 容量", value: MetricFormat.bytes(mem.swapUsedBytes))
-                        ConsoleStatRow(label: "当前已分配 Swap 总池", value: MetricFormat.bytes(mem.swapTotalBytes))
-                        ConsoleStatRow(label: "剩余已分配 Swap 空间", value: MetricFormat.bytes(swapFree))
+                    VStack(alignment: .leading, spacing: 6) {
+                        ConsoleStatRow(
+                            label: "交换引擎状态 (VM Swap)",
+                            value: swapEnabled ? "已开启 (满载时自动分配 swapfile)" : "已关闭",
+                            valueAccent: swapEnabled ? SenseiAccent.emerald.primaryColor : SenseiAccent.coral.primaryColor
+                        )
+                        ConsoleStatRow(
+                            label: "当前占用 / 已分配池",
+                            value: mem.swapTotalBytes == 0 && swapEnabled
+                                ? "0 MB / 0 MB (按需动态创建)"
+                                : "\(MetricFormat.bytes(mem.swapUsedBytes)) / \(MetricFormat.bytes(mem.swapTotalBytes)) (余 \(MetricFormat.bytes(swapFree)))"
+                        )
+                        ConsoleStatRow(
+                            label: "硬件虚拟化 (Hypervisor / VT-x)",
+                            value: hvSupported ? "已开启 (支持 Docker / OrbStack / UTM)" : "不可用",
+                            valueAccent: hvSupported ? SenseiAccent.cyan.primaryColor : SenseiAccent.amber.primaryColor
+                        )
                         ConsoleStatRow(
                             label: "NVMe 交换磨损保护",
-                            value: mem.swapUsedBytes == 0 ? "理想 (全驻留 RAM)" : "活跃交换中",
+                            value: mem.swapUsedBytes == 0 ? "理想 (全驻留 16GB RAM)" : "活跃交换中",
                             valueAccent: mem.swapUsedBytes == 0
                                 ? SenseiAccent.emerald.primaryColor
                                 : SenseiAccent.amber.primaryColor

@@ -178,6 +178,11 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate {
         showConsole()
     }
 
+    func openSettings() {
+        navigation.openSettings()
+        showConsole()
+    }
+
     private func ensureWindow() -> NSWindow {
         if let existing = window {
             return existing
@@ -199,7 +204,7 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate {
             defer: false
         )
         newWindow.minSize = NSSize(width: 980, height: 640)
-        newWindow.title = "XSensei Console — X-STATION V2"
+        newWindow.title = "Xmonitor — X-STATION V2"
         newWindow.titleVisibility = .hidden
         newWindow.titlebarAppearsTransparent = true
         newWindow.toolbarStyle = .unified

@@ -95,7 +95,7 @@ func expectApprox(
 
 @main
 @MainActor
-struct XSenseiTestRunner {
+struct XmonitorTestRunner {
     static func main() {
         var failures: [String] = []
 

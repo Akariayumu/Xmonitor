@@ -1,5 +1,5 @@
 #!/bin/bash
-# 在 macOS 上直接编译并运行测试二进制 build/XSenseiTests（不依赖 Xcode / XCTest）
+# 在 macOS 上直接编译并运行测试二进制 build/XmonitorTests（不依赖 Xcode / XCTest）
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -31,7 +31,7 @@ while IFS= read -r file; do
     SWIFT_FILES+=("$file")
 done < <(find Tests -name '*.swift' | sort)
 
-echo "==> 编译测试套件 build/XSenseiTests (${#SWIFT_FILES[@]} Swift files)"
+echo "==> 编译测试套件 build/XmonitorTests (${#SWIFT_FILES[@]} Swift files)"
 swiftc -O -swift-version 5 -parse-as-library \
     -target "$TARGET" \
     -import-objc-header Sources/Bridge/HardwareBridge.h \
@@ -45,11 +45,11 @@ swiftc -O -swift-version 5 -parse-as-library \
     -framework CoreWLAN \
     -framework Security \
     -framework ServiceManagement \
-    -o build/XSenseiTests
+    -o build/XmonitorTests
 
-ENTITLEMENTS_FILE="Resources/XSensei.entitlements"
+ENTITLEMENTS_FILE="Resources/Xmonitor.entitlements"
 if [[ "${ENABLE_SYSMOND_ENTITLEMENT:-0}" == "1" ]]; then
-    ENTITLEMENTS_FILE="build/XSensei.sysmond.entitlements"
+    ENTITLEMENTS_FILE="build/Xmonitor.sysmond.entitlements"
     cat > "$ENTITLEMENTS_FILE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,7 +64,7 @@ fi
 
 codesign --force --sign "$SIGN_IDENTITY" \
     --entitlements "$ENTITLEMENTS_FILE" \
-    build/XSenseiTests
+    build/XmonitorTests
 
-echo "==> 运行测试 build/XSenseiTests"
-./build/XSenseiTests "$@"
+echo "==> 运行测试 build/XmonitorTests"
+./build/XmonitorTests "$@"

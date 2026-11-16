@@ -1,11 +1,11 @@
 #!/bin/bash
-# 在 macOS 上编译并打包 XSensei：build/XSensei.app
+# 在 macOS 上编译并打包 Xmonitor：build/Xmonitor.app
 # 用法：scripts/build-app.sh [--install]   --install 复制到 /Applications 并启动
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP=build/XSensei.app
-VERSION=$(git describe --tags --always 2>/dev/null || echo 0.1.0)
+APP=build/Xmonitor.app
+VERSION=$(git describe --tags --always 2>/dev/null || echo 0.2.0)
 CERT_NAME="XSensei Dev"
 TARGET="x86_64-apple-macos14.0"
 
@@ -20,6 +20,20 @@ fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" build
+
+if [[ -f "Resources/AppIcon-1024.png" ]]; then
+    echo "==> 生成 macOS Retina 应用图标 AppIcon.icns"
+    ICONSET="build/AppIcon.iconset"
+    rm -rf "$ICONSET"
+    mkdir -p "$ICONSET"
+    for sz in 16 32 128 256 512; do
+        sz2=$((sz * 2))
+        sips -s format png -z "$sz" "$sz" "Resources/AppIcon-1024.png" --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
+        sips -s format png -z "$sz2" "$sz2" "Resources/AppIcon-1024.png" --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+    rm -rf "$ICONSET"
+fi
 
 echo "==> 编译 C 采集桥接层 (HardwareBridge.c)"
 clang -O3 -Wall -Wextra -std=c11 \
@@ -46,7 +60,7 @@ swiftc -O -swift-version 5 -parse-as-library \
     -framework CoreWLAN \
     -framework Security \
     -framework ServiceManagement \
-    -o "$APP/Contents/MacOS/XSensei"
+    -o "$APP/Contents/MacOS/Xmonitor"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -54,13 +68,17 @@ cat > "$APP/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.xstation.sensei</string>
+    <string>com.xstation.xmonitor</string>
     <key>CFBundleName</key>
-    <string>XSensei</string>
+    <string>Xmonitor</string>
     <key>CFBundleDisplayName</key>
-    <string>XSensei</string>
+    <string>Xmonitor</string>
     <key>CFBundleExecutable</key>
-    <string>XSensei</string>
+    <string>Xmonitor</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -77,9 +95,9 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-ENTITLEMENTS_FILE="Resources/XSensei.entitlements"
+ENTITLEMENTS_FILE="Resources/Xmonitor.entitlements"
 if [[ "${ENABLE_SYSMOND_ENTITLEMENT:-0}" == "1" ]]; then
-    ENTITLEMENTS_FILE="build/XSensei.sysmond.entitlements"
+    ENTITLEMENTS_FILE="build/Xmonitor.sysmond.entitlements"
     cat > "$ENTITLEMENTS_FILE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -99,16 +117,20 @@ echo "==> ${APP}（签名：${SIGN_IDENTITY}，权限文件：${ENTITLEMENTS_FIL
 
 if [[ "${1:-}" == "--install" ]]; then
     pkill -x XSensei 2>/dev/null || true
+    pkill -x Xmonitor 2>/dev/null || true
     for _ in {1..20}; do
-        pgrep -x XSensei >/dev/null 2>&1 || break
+        if ! pgrep -x XSensei >/dev/null 2>&1 && ! pgrep -x Xmonitor >/dev/null 2>&1; then
+            break
+        fi
         sleep 0.05
     done
-    rm -rf /Applications/XSensei.app
+    rm -rf /Applications/XSensei.app /Applications/Xmonitor.app
     cp -R "$APP" /Applications/
+    touch /Applications/Xmonitor.app
     if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
-        open /Applications/XSensei.app
-        echo "==> 已安装并启动 /Applications/XSensei.app"
+        open /Applications/Xmonitor.app
+        echo "==> 已安装并启动 /Applications/Xmonitor.app（旧版 XSensei.app 已清理）"
     else
-        echo "==> 已更新 /Applications/XSensei.app（当前未登录 GUI 会话 gui/$(id -u)，下次登录桌面时即可运行）"
+        echo "==> 已更新 /Applications/Xmonitor.app（当前未登录 GUI 会话 gui/$(id -u)，下次登录桌面时即可运行）"
     fi
 fi

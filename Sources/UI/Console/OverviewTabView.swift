@@ -99,7 +99,9 @@ struct OverviewTabView: View {
                         Text("X-STATION V2")
                             .font(.system(size: 19, weight: .bold))
                         ConsoleBadge(
-                            text: snap.power.hasS0ix ? "EFI v2.0 · S0ix Active" : "EFI v2.0 Ready",
+                            text: (snap.cpu.hasTemp && snap.gpu.hasFreq)
+                                ? "EFI v2.0.1 · Sensors & S0ix"
+                                : (snap.power.hasS0ix ? "EFI v2.0 · S0ix Active" : "EFI v2.0 Ready"),
                             icon: "moon.stars.fill",
                             accent: .emerald
                         )

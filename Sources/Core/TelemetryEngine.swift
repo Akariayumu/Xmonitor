@@ -17,7 +17,7 @@ private final class EngineCleanupBox: @unchecked Sendable {
 @MainActor
 final class TelemetryEngine: ObservableObject {
     static let historyCapacity = 60
-    private static let ambientInterval: TimeInterval = 2.0
+    private static let defaultAmbientInterval: TimeInterval = 2.0
     private static let interactiveInterval: TimeInterval = 1.0
     private static let smartRefreshSeconds: TimeInterval = 30.0
     private static let volumeRefreshSeconds: TimeInterval = 30.0
@@ -34,7 +34,8 @@ final class TelemetryEngine: ObservableObject {
     private(set) var netTxHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
     private(set) var diskReadHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
     private(set) var diskWriteHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
-    @Published private(set) var currentInterval: TimeInterval = ambientInterval
+    @Published private(set) var currentInterval: TimeInterval = defaultAmbientInterval
+    private var configuredAmbientInterval: TimeInterval = defaultAmbientInterval
     private(set) var wakeResetCount: Int = 0
     var requiresFastAmbientIoNet: (() -> Bool)?
 
@@ -75,8 +76,15 @@ final class TelemetryEngine: ObservableObject {
             refreshNow()
             applySchedule(triggerImmediateSample: false)
         } else {
-            currentInterval = Self.ambientInterval
+            currentInterval = configuredAmbientInterval
         }
+    }
+
+    func setAmbientInterval(_ seconds: TimeInterval) {
+        let clamped = min(10.0, max(1.0, seconds))
+        guard abs(configuredAmbientInterval - clamped) > 0.01 else { return }
+        configuredAmbientInterval = clamped
+        applySchedule(triggerImmediateSample: false)
     }
 
     deinit {
@@ -185,9 +193,9 @@ final class TelemetryEngine: ObservableObject {
         if isSuspended {
             target = 0.0
         } else if !interactiveTokens.isEmpty {
-            target = Self.interactiveInterval
+            target = min(Self.interactiveInterval, configuredAmbientInterval)
         } else {
-            target = Self.ambientInterval
+            target = configuredAmbientInterval
         }
 
         let intervalChanged = (currentInterval != target)

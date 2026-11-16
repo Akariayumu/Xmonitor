@@ -677,13 +677,14 @@ final class WidgetCardCanvasNSView: NSView {
                 abs(Int64(curr.storage.readBytesPerSec) - Int64(prev.storage.readBytesPerSec)) < 16_384 &&
                 abs(Int64(curr.storage.writeBytesPerSec) - Int64(prev.storage.writeBytesPerSec)) < 16_384
         case .powerS0ix:
+            if abs(prev.power.batteryWatts) >= 0.05 && abs(curr.power.batteryWatts) < 0.05 { return false }
             return curr.power.present == prev.power.present &&
                 curr.power.isPluggedIn == prev.power.isPluggedIn &&
                 curr.power.isCharging == prev.power.isCharging &&
                 widgetSafeRound(curr.power.percentage) == widgetSafeRound(prev.power.percentage) &&
                 curr.power.cycleCount == prev.power.cycleCount &&
-                abs(curr.power.batteryWatts - prev.power.batteryWatts) < 0.4 &&
-                abs(curr.cpu.packagePowerW - prev.cpu.packagePowerW) < 0.5 &&
+                abs(curr.power.batteryWatts - prev.power.batteryWatts) < 0.12 &&
+                abs(curr.cpu.packagePowerW - prev.cpu.packagePowerW) < 0.25 &&
                 curr.power.hasS0ix == prev.power.hasS0ix &&
                 curr.power.lastCC7Pct == prev.power.lastCC7Pct &&
                 curr.power.lastPC8Pct == prev.power.lastPC8Pct &&

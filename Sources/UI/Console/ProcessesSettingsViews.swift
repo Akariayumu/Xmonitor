@@ -377,8 +377,8 @@ private struct SettingsPaneView: View {
         return GlassCard(padding: 16, cornerRadius: 16, opacity: settings.widgetOpacity) {
             VStack(alignment: .leading, spacing: 14) {
                 ConsoleSectionHeader(
-                    title: "登录自启与自适应采样策略",
-                    subtitle: "ServiceManagement SMAppService.mainApp · 免守护进程",
+                    title: "登录自启与采样频率自定义",
+                    subtitle: "ServiceManagement 免守护进程自启 · 三档后台采样速率可调",
                     icon: "power.circle.fill",
                     accent: .emerald,
                     trailingBadge: launchStatusBadgeText
@@ -393,7 +393,7 @@ private struct SettingsPaneView: View {
                     )
                 ) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("登录 macOS 时自动启动 XSensei")
+                        Text("登录 macOS 时自动启动 Xmonitor")
                             .font(.system(size: 12.5, weight: .semibold))
                         Text("静默驻留顶部菜单栏与壁纸层小组件（无 Dock 图标干扰）")
                             .font(.system(size: 11))
@@ -403,7 +403,7 @@ private struct SettingsPaneView: View {
                 .toggleStyle(.switch)
 
                 if loginStatus == .requiresApproval {
-                    Text("请在「系统设置 → 通用 → 登录项」中允许 XSensei 在后台运行。")
+                    Text("请在「系统设置 → 通用 → 登录项」中允许 Xmonitor 在后台运行。")
                         .font(.system(size: 11))
                         .foregroundStyle(SenseiAccent.amber.primaryColor)
                 }
@@ -416,18 +416,57 @@ private struct SettingsPaneView: View {
 
                 Divider().opacity(0.3)
 
-                VStack(alignment: .leading, spacing: 5) {
-                    ConsoleStatRow(
-                        label: "当前活跃采样周期",
-                        value: String(format: "%.1f 秒 / 次", engine.currentInterval),
-                        valueAccent: SenseiAccent.cyan.primaryColor
-                    )
-                    ConsoleStatRow(label: "控制台 / 下拉面板展开时", value: "1.0s 高速档 (含 Top 进程)")
-                    ConsoleStatRow(label: "仅菜单栏 / 桌面组件常驻时", value: "2.0s 节能档 (< 0.3% CPU)")
-                    ConsoleStatRow(label: "屏幕熄灭 / S0ix 睡眠期间", value: "0 Hz 完全挂起定时器")
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("后台常驻采样间隔")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(String(format: "当前活跃 %.1fs", engine.currentInterval))
+                            .font(.system(size: 11, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(SenseiAccent.emerald.primaryColor)
+                    }
+
+                    HStack(spacing: 8) {
+                        intervalOptionButton(seconds: 1.0, title: "1.0s 实时", icon: "bolt.fill")
+                        intervalOptionButton(seconds: 2.0, title: "2.0s 均衡", icon: "gauge.with.dots.needle.50percent")
+                        intervalOptionButton(seconds: 5.0, title: "5.0s 静默", icon: "leaf.fill")
+                    }
+
+                    Text("注：展开控制台或菜单栏弹窗时自动升至 1.0s；熄屏或 S0ix 睡眠期间自动停表 (0 Hz)。")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
                 }
             }
         }
+    }
+
+    private func intervalOptionButton(seconds: Double, title: String, icon: String) -> some View {
+        let selected = abs(settings.ambientRefreshInterval - seconds) < 0.1
+        return Button {
+            settings.ambientRefreshInterval = seconds
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .monospacedDigit()
+            }
+            .foregroundStyle(selected ? .white : .primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7.5)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(
+                        selected
+                            ? AnyShapeStyle(SenseiAccent.emerald.gradient)
+                            : AnyShapeStyle(Color.primary.opacity(0.07))
+                    )
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private var launchStatusBadgeText: String {
@@ -451,7 +490,7 @@ private struct SettingsPaneView: View {
             loginStatus = SMAppService.mainApp.status
         } catch {
             loginStatus = SMAppService.mainApp.status
-            loginErrorMessage = "更新登录启动项失败（请确认应用已安装于 /Applications/XSensei.app）：\(error.localizedDescription)"
+            loginErrorMessage = "更新登录启动项失败（请确认应用已安装于 /Applications/Xmonitor.app）：\(error.localizedDescription)"
         }
     }
 
@@ -460,7 +499,7 @@ private struct SettingsPaneView: View {
             VStack(alignment: .leading, spacing: 14) {
                 ConsoleSectionHeader(
                     title: "主题模式与毛玻璃通透度",
-                    subtitle: "支持跟随系统、深色石墨与浅色磨砂三种 Sensei 视觉风格",
+                    subtitle: "支持跟随系统、深色石墨与浅色磨砂三种视觉风格",
                     icon: "paintbrush.pointed.fill",
                     accent: .indigo,
                     trailingBadge: "\(Int((settings.widgetOpacity * 100).rounded()))%"
@@ -541,71 +580,127 @@ private struct SettingsPaneView: View {
     private var menuBarModulesCard: some View {
         GlassCard(padding: 16, cornerRadius: 16, opacity: settings.widgetOpacity) {
             VStack(alignment: .leading, spacing: 14) {
-                ConsoleSectionHeader(
-                    title: "顶部菜单栏实时显示项",
-                    subtitle: "等宽数字固定位宽渲染 · 数字刷新零左右抖动",
-                    icon: "menubar.rectangle",
-                    accent: .cyan
-                )
+                HStack(spacing: 10) {
+                    ConsoleSectionHeader(
+                        title: "顶部菜单栏样式、内容与排序自定义",
+                        subtitle: "采用 macOS 原生菜单栏模板纯白/纯黑同色渲染 · 零灰白割裂 · 零位宽抖动",
+                        icon: "menubar.rectangle",
+                        accent: .cyan,
+                        trailingBadge: settings.menuBarStyle.displayTitle
+                    )
 
-                LazyVGrid(columns: twoColumns, spacing: 10) {
-                    menuToggleTile(
-                        title: "处理器占用与峰值频率",
-                        example: "CPU  8% 0.9G",
-                        icon: "cpu.fill",
-                        isOn: $settings.showMenuCPU
-                    )
-                    menuToggleTile(
-                        title: "Iris Xe 核显占用率",
-                        example: "GPU  2%",
-                        icon: "display",
-                        isOn: $settings.showMenuGPU
-                    )
-                    menuToggleTile(
-                        title: "LPDDR4X 内存使用率",
-                        example: "RAM 54%",
-                        icon: "memorychip.fill",
-                        isOn: $settings.showMenuRAM
-                    )
-                    menuToggleTile(
-                        title: "充放电 / 封装实时瓦数",
-                        example: "4.1W",
-                        icon: "bolt.fill",
-                        isOn: $settings.showMenuPower
-                    )
-                    menuToggleTile(
-                        title: "Wi-Fi 6 实时网速",
-                        example: "↓ 1.2 MB/s",
-                        icon: "wifi",
-                        isOn: $settings.showMenuNet
-                    )
-                    menuToggleTile(
-                        title: "CPU 封装温度 (SMC)",
-                        example: "46°C",
-                        icon: "thermometer.medium",
-                        isOn: $settings.showMenuTemp
-                    )
+                    if settings.menuModuleOrder != MenuBarModule.defaultOrder {
+                        Button {
+                            settings.resetMenuModuleOrder()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.up.arrow.down")
+                                    .font(.system(size: 10.5, weight: .semibold))
+                                Text("恢复默认顺序")
+                                    .font(.system(size: 11.5, weight: .semibold))
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Capsule(style: .continuous).fill(Color.primary.opacity(0.07)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                // 3-way MenuBar layout style selector
+                HStack(spacing: 10) {
+                    menuStyleOptionCard(style: .stacked, icon: "rectangle.split.1x2.fill")
+                    menuStyleOptionCard(style: .inline, icon: "textformat.123")
+                    menuStyleOptionCard(style: .minimal, icon: "sparkles.rectangle.stack.fill")
+                }
+
+                // Fine-grained MenuBar toggles
+                HStack(spacing: 18) {
+                    Toggle("CPU 同时显示实时频率 (GHz)", isOn: $settings.showMenuCpuFreq)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 12, weight: .medium))
+
+                    Toggle("显示模块间竖向分隔细线", isOn: $settings.showMenuDividers)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 12, weight: .medium))
+
+                    Spacer()
+
+                    Text("点击右侧 ↑ / ↓ 可自由调整菜单栏模块从左到右的显示顺序")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 4)
+
+                // Reorderable module rows
+                VStack(spacing: 7) {
+                    ForEach(Array(settings.menuModuleOrder.enumerated()), id: \.element.id) { index, module in
+                        menuModuleOrderRow(
+                            module: module,
+                            isFirst: index == 0,
+                            isLast: index == settings.menuModuleOrder.count - 1
+                        )
+                    }
                 }
             }
         }
     }
 
-    private func menuToggleTile(
-        title: String,
-        example: String,
-        icon: String,
-        isOn: Binding<Bool>
+    private func menuStyleOptionCard(style: MenuBarLayoutStyle, icon: String) -> some View {
+        let selected = (settings.menuBarStyle == style)
+        return Button {
+            settings.menuBarStyle = style
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Image(systemName: icon)
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Text(style.displayTitle)
+                        .font(.system(size: 12.5, weight: .bold))
+                    Spacer()
+                    if selected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 13, weight: .bold))
+                    }
+                }
+                Text(style.subtitle)
+                    .font(.system(size: 10.5))
+                    .opacity(selected ? 0.92 : 0.72)
+                    .lineLimit(1)
+            }
+            .foregroundStyle(selected ? .white : .primary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(
+                        selected
+                            ? AnyShapeStyle(SenseiAccent.cyan.gradient)
+                            : AnyShapeStyle(Color.primary.opacity(0.055))
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func menuModuleOrderRow(
+        module: MenuBarModule,
+        isFirst: Bool,
+        isLast: Bool
     ) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: icon)
+        let enabled = settings.isModuleEnabled(module)
+        return HStack(spacing: 12) {
+            Image(systemName: module.sfSymbol)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(isOn.wrappedValue ? SenseiAccent.cyan.primaryColor : .secondary)
+                .foregroundStyle(enabled ? SenseiAccent.cyan.primaryColor : .secondary)
                 .frame(width: 22)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
+            VStack(alignment: .leading, spacing: 1.5) {
+                Text(module.title)
                     .font(.system(size: 12, weight: .semibold))
-                Text("示例：\(example)")
+                Text("示例：\(module.exampleText)")
                     .font(.system(size: 10.5))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
@@ -613,12 +708,46 @@ private struct SettingsPaneView: View {
 
             Spacer()
 
-            Toggle("", isOn: isOn)
-                .labelsHidden()
-                .toggleStyle(.checkbox)
+            HStack(spacing: 4) {
+                Button {
+                    settings.moveMenuModule(module, by: -1)
+                } label: {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .frame(width: 24, height: 22)
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(0.07)))
+                }
+                .buttonStyle(.plain)
+                .disabled(isFirst)
+                .opacity(isFirst ? 0.30 : 1.0)
+                .help("向前移动模块")
+
+                Button {
+                    settings.moveMenuModule(module, by: 1)
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .frame(width: 24, height: 22)
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(0.07)))
+                }
+                .buttonStyle(.plain)
+                .disabled(isLast)
+                .opacity(isLast ? 0.30 : 1.0)
+                .help("向后移动模块")
+            }
+
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { settings.isModuleEnabled(module) },
+                    set: { settings.setModuleEnabled(module, enabled: $0) }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.switch)
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.vertical, 8.5)
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(Color.primary.opacity(0.045))
@@ -824,9 +953,9 @@ private struct SettingsPaneView: View {
                     .foregroundStyle(SenseiAccent.emerald.primaryColor)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("XSensei Hardware Telemetry Suite · X-STATION V2 Edition")
+                    Text("Xmonitor Hardware Telemetry Suite · X-STATION V2 Edition")
                         .font(.system(size: 12.5, weight: .semibold))
-                    Text("关闭本控制台窗口将自动隐藏 Dock 图标，顶部菜单栏与桌面小组件继续以 2.0s 节能档后台常驻。")
+                    Text("关闭本控制台窗口将自动隐藏 Dock 图标，顶部菜单栏与桌面小组件继续在后台低功耗常驻。")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
@@ -834,12 +963,30 @@ private struct SettingsPaneView: View {
                 Spacer()
 
                 Button {
+                    settings.resetAllToDefaults()
+                    widgetManager.resetAllPositions()
+                    widgetManager.refreshVisibilityAndFrames()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.system(size: 10.5, weight: .semibold))
+                        Text("恢复默认偏好")
+                            .font(.system(size: 11.5, weight: .semibold))
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 7)
+                    .background(Capsule(style: .continuous).fill(Color.primary.opacity(0.07)))
+                }
+                .buttonStyle(.plain)
+
+                Button {
                     NSApp.terminate(nil)
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "power")
                             .font(.system(size: 11, weight: .bold))
-                        Text("退出 XSensei")
+                        Text("退出 Xmonitor")
                             .font(.system(size: 11.5, weight: .semibold))
                     }
                     .foregroundStyle(SenseiAccent.coral.primaryColor)

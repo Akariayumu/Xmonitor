@@ -195,6 +195,38 @@ func runBridgeCoreTests() throws {
     try expectEqual(posMA, 1500, "positive mA decode")
     try expectApprox(chargeW, 18.0, tol: 1e-4, "positive charge watts")
 
+    // 3a. X-STATION V2 mWh/mW battery quirk (DesignCapacity=41349 mWh @ 11550 mV -> rawRate is mW, NOT mA!)
+    var xstationMA: Int32 = 0
+    let xstationDischargeW = xs_calc_battery_power(11550, 41349, UInt64(bitPattern: -7200), &xstationMA)
+    try expectApprox(xstationDischargeW, -7.20, tol: 1e-4, "X-STATION V2 mWh battery decodes -7200 rawRate as -7.20 W (not -83.16 W)")
+    try expectEqual(xstationMA, -623, "X-STATION V2 mWh battery derives -623 mA at 11.55 V")
+
+    var stdMA: Int32 = 0
+    let stdDischargeW = xs_calc_battery_power(11550, 3580, UInt64(bitPattern: -623), &stdMA)
+    try expectEqual(stdMA, -623, "standard mAh battery preserves -623 mA")
+    try expectApprox(stdDischargeW, -7.19565, tol: 1e-4, "standard mAh battery scales mA * mV")
+
+    // 3a-ii. Continuous battery discharge tracking across SMCBatteryManager poll gaps (unplug freeze regression)
+    var battTracker = XSBatteryDischargeTracker()
+    // Tick 0: AC plugged in & full -> 0.0 W
+    let acIdleW = xs_step_battery_discharge_tracking(&battTracker, true, false, true, 0, 0.0, 2.0, 1_000_000_000)
+    try expectApprox(acIdleW, 0.0, tol: 1e-6, "AC full idle emits 0.0 W")
+    // Tick 1 (t=2.0s): Unplug transient spike (-14.5 W at CPU RAPL 9.0 W)
+    let unplugSpikeW = xs_step_battery_discharge_tracking(&battTracker, false, false, false, -14500, -14.5, 9.0, 2_000_000_000)
+    try expectApprox(unplugSpikeW, -14.5, tol: 1e-4, "unplug tick anchors to fuel gauge -14.5 W")
+    // Tick 2 (t=4.0s, >1.5s later): AppleSmartBattery / B0AC still latched at -14500, while CPU settled from 9.0 W -> 1.8 W!
+    let settledW = xs_step_battery_discharge_tracking(&battTracker, false, false, false, -14500, -14.5, 1.8, 4_000_000_000)
+    try expectApprox(settledW, -7.3, tol: 1e-4, "latched fuel-gauge tracks live RAPL drop (-14.5 -> -7.3 W) instead of freezing")
+    // Tick 3 (t=6.0s): User starts workload on battery (CPU jumps to 16.8 W while gauge still latched)
+    let burstW = xs_step_battery_discharge_tracking(&battTracker, false, false, false, -14500, -14.5, 16.8, 6_000_000_000)
+    try expectApprox(burstW, -22.3, tol: 1e-4, "latched fuel-gauge tracks live RAPL burst (-22.3 W)")
+    // Tick 4 (t=7.0s): SMC B0AC produces fresh fuel-gauge reading (-6800 mW at CPU 2.1 W) -> re-anchors cleanly!
+    let reanchoredW = xs_step_battery_discharge_tracking(&battTracker, false, false, false, -6800, -6.8, 2.1, 7_000_000_000)
+    try expectApprox(reanchoredW, -6.8, tol: 1e-4, "fresh B0AC reading re-anchors exact fuel-gauge watts")
+    // Tick 5 (t=8.0s): Plug AC back in (charging at +0.64 W) -> immediately exits battery tracking!
+    let replugW = xs_step_battery_discharge_tracking(&battTracker, true, true, false, 640, 0.64, 3.0, 8_000_000_000)
+    try expectApprox(replugW, 0.64, tol: 1e-4, "replugging AC immediately switches to +0.64 W charging")
+
     // 3b. S0ixStandby refreshGpuFreq >= 0.5% gating & latch state machine
     try runGpuFreqProbeGatingTests()
 

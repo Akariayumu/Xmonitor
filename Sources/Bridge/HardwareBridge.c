@@ -17,6 +17,7 @@
 #include <mach/mach_time.h>
 #include <mach/processor_info.h>
 #include <mach/vm_map.h>
+#include <math.h>
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <netinet/in.h>
@@ -195,6 +196,12 @@ struct XSBridgeContext {
     uint32_t smcCoreKeys[8];
     XSSMCKeyInfo smcCoreInfos[8];
     uint32_t smcCoreCount;
+    bool smcHasAcin;
+    XSSMCKeyInfo smcAcinInfo;
+    bool smcHasB0ac;
+    XSSMCKeyInfo smcB0acInfo;
+    bool smcHasB0av;
+    XSSMCKeyInfo smcB0avInfo;
 
     io_service_t accelService;
     io_service_t batteryService;
@@ -218,6 +225,12 @@ struct XSBridgeContext {
     uint32_t powerSampleCount;
     uint64_t lastPowerSampleNs;
     XSPowerMetrics cachedPowerMetrics;
+    bool hasBattRegCache;
+    uint64_t lastBattRegSampleNs;
+    int64_t cachedDesignCapacity;
+    int64_t cachedRegRawRate;
+    XSPowerMetrics cachedBattReg;
+    XSBatteryDischargeTracker battTracker;
     uint32_t gpuRegSampleCount;
     uint64_t lastGpuRegSampleNs;
     uint64_t cachedGartUsedBytes;
@@ -329,6 +342,94 @@ double xs_calc_battery_watts(int64_t voltageMV, uint64_t rawInstantAmperage, int
         return 0.0;
     }
     return ((double)voltageMV * (double)ma) / 1000000.0;
+}
+
+double xs_calc_battery_power(int64_t voltageMV, int64_t designCapacity, uint64_t rawRate, int32_t *outSignedMA) {
+    int64_t signedRate = (int64_t)rawRate;
+    if (signedRate > 32767 && signedRate <= 65535) {
+        signedRate = (int64_t)(int16_t)(uint16_t)rawRate;
+    }
+    if (signedRate < INT32_MIN) signedRate = INT32_MIN;
+    if (signedRate > INT32_MAX) signedRate = INT32_MAX;
+
+    /* Detect ACPI mWh/mW batteries where SMCBatteryManager left _BIF/_BST unscaled
+     * (e.g. X-STATION V2: DesignCapacity=41349 mWh @ 11550 mV -> 477.6M > 150M mV*mAh). */
+    bool rateIsMilliwatts = (designCapacity > 0 &&
+                             voltageMV > 5000 &&
+                             (designCapacity * voltageMV) > 150000000LL);
+    if (rateIsMilliwatts) {
+        double watts = (double)signedRate / 1000.0;
+        if (outSignedMA) {
+            *outSignedMA = (voltageMV > 0)
+                ? (int32_t)llround(((double)signedRate * 1000.0) / (double)voltageMV)
+                : (int32_t)signedRate;
+        }
+        return watts;
+    }
+
+    return xs_calc_battery_watts(voltageMV, rawRate, outSignedMA);
+}
+
+double xs_step_battery_discharge_tracking(
+    XSBatteryDischargeTracker *tracker,
+    bool isPluggedIn,
+    bool isCharging,
+    bool isFullyCharged,
+    int64_t rawRate,
+    double rawBatteryWatts,
+    double currentPkgWatts,
+    uint64_t nowMonoNs)
+{
+    if (!tracker) {
+        return rawBatteryWatts;
+    }
+
+    if (isPluggedIn) {
+        memset(tracker, 0, sizeof(*tracker));
+        if (isFullyCharged && !isCharging) {
+            return 0.0;
+        }
+        if (!isCharging && rawBatteryWatts < 0.0) {
+            return 0.0;
+        }
+        return rawBatteryWatts;
+    }
+
+    /* Pure DC battery discharge: if EC has not yet flipped rate negative at unplug instant,
+     * synthesize immediate discharge from live SoC RAPL + baseline platform draw (~3.5 W). */
+    if (rawBatteryWatts >= -0.05) {
+        double pkg = (currentPkgWatts > 0.2) ? currentPkgWatts : 1.5;
+        return -(pkg + 3.5);
+    }
+
+    bool freshGauge = !tracker->onBatteryActive || (rawRate != tracker->lastRawRate);
+    if (freshGauge) {
+        tracker->onBatteryActive = true;
+        tracker->lastRawRate = rawRate;
+        tracker->anchorWatts = rawBatteryWatts;
+        tracker->anchorPkgWatts = (currentPkgWatts > 0.0) ? currentPkgWatts : 0.0;
+        tracker->anchorMonoNs = nowMonoNs;
+        return rawBatteryWatts;
+    }
+
+    if (tracker->anchorPkgWatts <= 0.0 && currentPkgWatts > 0.0) {
+        tracker->anchorPkgWatts = currentPkgWatts;
+    }
+
+    if (nowMonoNs > tracker->anchorMonoNs &&
+        (nowMonoNs - tracker->anchorMonoNs) >= 1500000000ULL &&
+        currentPkgWatts > 0.0 &&
+        tracker->anchorPkgWatts > 0.0) {
+        double deltaPkgW = currentPkgWatts - tracker->anchorPkgWatts;
+        double liveWatts = tracker->anchorWatts - deltaPkgW;
+        double minDischargeMag = currentPkgWatts + 0.5;
+        if (liveWatts > -minDischargeMag) {
+            liveWatts = -minDischargeMag;
+        }
+        return liveWatts;
+    }
+
+    return tracker->anchorWatts;
 }
 
 /* ========================================================================== *
@@ -450,11 +551,41 @@ static bool xs_smc_read_temp(io_connect_t conn, uint32_t key, const XSSMCKeyInfo
     return true;
 }
 
+static bool xs_smc_read_raw_bytes(
+    io_connect_t conn,
+    uint32_t key,
+    const XSSMCKeyInfo *info,
+    uint8_t outBytes[32])
+{
+    if (conn == IO_OBJECT_NULL || !info || info->dataSize == 0 || info->dataSize > 32 || !outBytes) {
+        return false;
+    }
+    XSSMCKeyData inData;
+    XSSMCKeyData outData;
+    memset(&inData, 0, sizeof(inData));
+    memset(&outData, 0, sizeof(outData));
+    inData.key = key;
+    inData.keyInfo.dataSize = info->dataSize;
+    inData.data8 = XS_SMC_CMD_READ_BYTES;
+
+    size_t outSize = sizeof(outData);
+    kern_return_t kr = IOConnectCallStructMethod(
+        conn, XS_SMC_KERNEL_INDEX, &inData, sizeof(inData), &outData, &outSize);
+    if (kr != KERN_SUCCESS || outData.result != 0) {
+        return false;
+    }
+    memcpy(outBytes, outData.bytes, 32);
+    return true;
+}
+
 static void xs_probe_smc_keys(XSBridgeContext *ctx) {
     ctx->smcProbed = true;
     ctx->smcHasTemp = false;
     ctx->smcPkgKey = 0;
     ctx->smcCoreCount = 0;
+    ctx->smcHasAcin = false;
+    ctx->smcHasB0ac = false;
+    ctx->smcHasB0av = false;
 
     if (ctx->smcConn == IO_OBJECT_NULL) {
         io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"));
@@ -495,6 +626,27 @@ static void xs_probe_smc_keys(XSBridgeContext *ctx) {
             ctx->smcCoreCount++;
             ctx->smcHasTemp = true;
         }
+    }
+
+    uint8_t testBytes[32];
+    XSSMCKeyInfo bInfo;
+    if (xs_smc_get_key_info(ctx->smcConn, xs_fourcc("ACIN"), &bInfo) &&
+        bInfo.dataSize >= 1 &&
+        xs_smc_read_raw_bytes(ctx->smcConn, xs_fourcc("ACIN"), &bInfo, testBytes)) {
+        ctx->smcAcinInfo = bInfo;
+        ctx->smcHasAcin = true;
+    }
+    if (xs_smc_get_key_info(ctx->smcConn, xs_fourcc("B0AC"), &bInfo) &&
+        bInfo.dataSize >= 2 &&
+        xs_smc_read_raw_bytes(ctx->smcConn, xs_fourcc("B0AC"), &bInfo, testBytes)) {
+        ctx->smcB0acInfo = bInfo;
+        ctx->smcHasB0ac = true;
+    }
+    if (xs_smc_get_key_info(ctx->smcConn, xs_fourcc("B0AV"), &bInfo) &&
+        bInfo.dataSize >= 2 &&
+        xs_smc_read_raw_bytes(ctx->smcConn, xs_fourcc("B0AV"), &bInfo, testBytes)) {
+        ctx->smcB0avInfo = bInfo;
+        ctx->smcHasB0av = true;
     }
 }
 
@@ -959,53 +1111,140 @@ static void xs_sample_memory(XSBridgeContext *ctx, XSMemoryMetrics *mem) {
     }
 }
 
-static void xs_sample_power_s0ix(XSBridgeContext *ctx, uint64_t nowMonoNs, XSPowerMetrics *pwr) {
+static void xs_sample_power_s0ix(
+    XSBridgeContext *ctx,
+    uint64_t nowMonoNs,
+    double currentPkgWatts,
+    XSPowerMetrics *pwr)
+{
+    /* Sub-250ms burst guard for tight benchmark loops; every 1.0s/2.0s/5.0s UI tick executes live */
     if (ctx->powerSampleCount >= 2 &&
         nowMonoNs > ctx->lastPowerSampleNs &&
-        (nowMonoNs - ctx->lastPowerSampleNs) < 5500000000ULL) {
+        (nowMonoNs - ctx->lastPowerSampleNs) < 250000000ULL) {
         *pwr = ctx->cachedPowerMetrics;
         return;
     }
 
-    /* 1. AppleSmartBattery */
+    if (!ctx->smcProbed) {
+        xs_probe_smc_keys(ctx);
+    }
+
+    /* Read live SMC ACIN / B0AC / B0AV first (bypasses AppleSmartBattery 30-60s IORegistry lag) */
+    bool liveSmcAcValid = false;
+    bool liveSmcPluggedIn = false;
+    bool liveSmcRateValid = false;
+    int64_t liveSmcRawRate = 0;
+    bool liveSmcVoltValid = false;
+    int64_t liveSmcVoltageMV = 0;
+    uint8_t smcBuf[32];
+
+    if (ctx->smcHasAcin &&
+        xs_smc_read_raw_bytes(ctx->smcConn, xs_fourcc("ACIN"), &ctx->smcAcinInfo, smcBuf)) {
+        liveSmcPluggedIn = (smcBuf[0] != 0);
+        liveSmcAcValid = true;
+    }
+    if (ctx->smcHasB0ac &&
+        xs_smc_read_raw_bytes(ctx->smcConn, xs_fourcc("B0AC"), &ctx->smcB0acInfo, smcBuf)) {
+        int16_t s16 = (int16_t)(((uint16_t)smcBuf[0] << 8) | (uint16_t)smcBuf[1]);
+        liveSmcRawRate = (int64_t)s16;
+        liveSmcRateValid = true;
+    }
+    if (ctx->smcHasB0av &&
+        xs_smc_read_raw_bytes(ctx->smcConn, xs_fourcc("B0AV"), &ctx->smcB0avInfo, smcBuf)) {
+        uint16_t u16 = (uint16_t)(((uint16_t)smcBuf[0] << 8) | (uint16_t)smcBuf[1]);
+        if (u16 > 3000) {
+            liveSmcVoltageMV = (int64_t)u16;
+            liveSmcVoltValid = true;
+        }
+    }
+
+    /* 1. AppleSmartBattery IORegistry (refreshed every 1.5s or immediately on AC state flip) */
     if (ctx->batteryService == IO_OBJECT_NULL) {
         ctx->batteryService = IOServiceGetMatchingService(
             kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"));
     }
     if (ctx->batteryService != IO_OBJECT_NULL) {
-        CFMutableDictionaryRef battProps = NULL;
-        if (IORegistryEntryCreateCFProperties(ctx->batteryService, &battProps, kCFAllocatorDefault, 0) == KERN_SUCCESS &&
-            battProps != NULL) {
-            pwr->present = true;
-            pwr->isPluggedIn = xs_dict_bool_or(battProps, CFSTR("ExternalConnected"), false);
-            pwr->isCharging = xs_dict_bool_or(battProps, CFSTR("IsCharging"), false);
-            pwr->isFullyCharged = xs_dict_bool_or(battProps, CFSTR("FullyCharged"), false);
+        bool acFlipped = liveSmcAcValid &&
+                         ctx->hasBattRegCache &&
+                         (liveSmcPluggedIn != ctx->cachedBattReg.isPluggedIn);
+        bool regExpired = !ctx->hasBattRegCache ||
+                          nowMonoNs <= ctx->lastBattRegSampleNs ||
+                          (nowMonoNs - ctx->lastBattRegSampleNs) >= 1500000000ULL;
 
-            int64_t curCap = xs_dict_int64_or(battProps, CFSTR("CurrentCapacity"), 0);
-            int64_t maxCap = xs_dict_int64_or(battProps, CFSTR("MaxCapacity"), 0);
-            if (maxCap > 0 && curCap >= 0) {
-                double pct = ((double)curCap / (double)maxCap) * 100.0;
-                if (pct > 100.0) pct = 100.0;
-                pwr->percentage = pct;
+        if (acFlipped || regExpired) {
+            CFMutableDictionaryRef battProps = NULL;
+            if (IORegistryEntryCreateCFProperties(ctx->batteryService, &battProps, kCFAllocatorDefault, 0) == KERN_SUCCESS &&
+                battProps != NULL) {
+                XSPowerMetrics regSnap;
+                memset(&regSnap, 0, sizeof(regSnap));
+                regSnap.present = true;
+                regSnap.isPluggedIn = xs_dict_bool_or(battProps, CFSTR("ExternalConnected"), false);
+                regSnap.isCharging = xs_dict_bool_or(battProps, CFSTR("IsCharging"), false);
+                regSnap.isFullyCharged = xs_dict_bool_or(battProps, CFSTR("FullyCharged"), false);
+
+                int64_t curCap = xs_dict_int64_or(battProps, CFSTR("CurrentCapacity"), 0);
+                int64_t maxCap = xs_dict_int64_or(battProps, CFSTR("MaxCapacity"), 0);
+                if (maxCap > 0 && curCap >= 0) {
+                    double pct = ((double)curCap / (double)maxCap) * 100.0;
+                    if (pct > 100.0) pct = 100.0;
+                    regSnap.percentage = pct;
+                }
+
+                int64_t rawMax = xs_dict_int64_or(battProps, CFSTR("AppleRawMaxCapacity"), maxCap);
+                int64_t designCap = xs_dict_int64_or(battProps, CFSTR("DesignCapacity"), 0);
+                if (designCap > 0 && rawMax > 0) {
+                    regSnap.healthPct = ((double)rawMax / (double)designCap) * 100.0;
+                }
+
+                int64_t voltageMV = xs_dict_int64_or(battProps, CFSTR("Voltage"), 0);
+                regSnap.voltageMV = (int32_t)voltageMV;
+
+                int64_t rawAmp = 0;
+                if (!xs_dict_get_int64(battProps, CFSTR("InstantAmperage"), &rawAmp)) {
+                    (void)xs_dict_get_int64(battProps, CFSTR("Amperage"), &rawAmp);
+                }
+                regSnap.cycleCount = (int32_t)xs_dict_int64_or(battProps, CFSTR("CycleCount"), 0);
+
+                ctx->cachedBattReg = regSnap;
+                ctx->cachedDesignCapacity = designCap;
+                ctx->cachedRegRawRate = rawAmp;
+                ctx->hasBattRegCache = true;
+                ctx->lastBattRegSampleNs = nowMonoNs;
+
+                CFRelease(battProps);
             }
+        }
 
-            int64_t rawMax = xs_dict_int64_or(battProps, CFSTR("AppleRawMaxCapacity"), maxCap);
-            int64_t designCap = xs_dict_int64_or(battProps, CFSTR("DesignCapacity"), 0);
-            if (designCap > 0 && rawMax > 0) {
-                pwr->healthPct = ((double)rawMax / (double)designCap) * 100.0;
+        if (ctx->hasBattRegCache) {
+            *pwr = ctx->cachedBattReg;
+            if (liveSmcAcValid) {
+                pwr->isPluggedIn = liveSmcPluggedIn;
+                if (!liveSmcPluggedIn) {
+                    pwr->isCharging = false;
+                }
             }
-
-            int64_t voltageMV = xs_dict_int64_or(battProps, CFSTR("Voltage"), 0);
+            int64_t voltageMV = liveSmcVoltValid ? liveSmcVoltageMV : (int64_t)pwr->voltageMV;
             pwr->voltageMV = (int32_t)voltageMV;
 
-            int64_t rawAmp = 0;
-            if (!xs_dict_get_int64(battProps, CFSTR("InstantAmperage"), &rawAmp)) {
-                (void)xs_dict_get_int64(battProps, CFSTR("Amperage"), &rawAmp);
-            }
-            pwr->batteryWatts = xs_calc_battery_watts(voltageMV, (uint64_t)rawAmp, &pwr->amperageMA);
-            pwr->cycleCount = (int32_t)xs_dict_int64_or(battProps, CFSTR("CycleCount"), 0);
+            int64_t rawRate = liveSmcRateValid ? liveSmcRawRate : ctx->cachedRegRawRate;
+            double rawBattWatts = xs_calc_battery_power(
+                voltageMV, ctx->cachedDesignCapacity, (uint64_t)rawRate, &pwr->amperageMA);
 
-            CFRelease(battProps);
+            pwr->batteryWatts = xs_step_battery_discharge_tracking(
+                &ctx->battTracker,
+                pwr->isPluggedIn,
+                pwr->isCharging,
+                pwr->isFullyCharged,
+                rawRate,
+                rawBattWatts,
+                currentPkgWatts,
+                nowMonoNs);
+
+            if (!pwr->isPluggedIn && voltageMV > 0) {
+                pwr->amperageMA = (int32_t)llround((pwr->batteryWatts * 1000000.0) / (double)voltageMV);
+            } else if (pwr->isPluggedIn && fabs(pwr->batteryWatts) < 1e-6) {
+                pwr->amperageMA = 0;
+            }
         }
     }
 
@@ -1232,29 +1471,6 @@ static void xs_init_storage_handles(XSBridgeContext *ctx) {
             }
             IOObjectRelease(childIter);
         }
-
-        /* 3. Open NVMeSMARTLib.plugin COM interface (released cleanly in xs_bridge_destroy) */
-        IOCFPlugInInterface **plugIn = NULL;
-        SInt32 score = 0;
-        if (IOCreatePlugInInterfaceForService(
-                ctx->nvmeBlockService,
-                kIONVMeSMARTUserClientTypeID,
-                kIOCFPlugInInterfaceID,
-                &plugIn,
-                &score) == KERN_SUCCESS &&
-            plugIn != NULL) {
-            IONVMeSMARTInterface **smartIf = NULL;
-            HRESULT hr = (*plugIn)->QueryInterface(
-                plugIn,
-                CFUUIDGetUUIDBytes(kIONVMeSMARTInterfaceID),
-                (LPVOID *)&smartIf);
-            if (hr == S_OK && smartIf != NULL) {
-                ctx->nvmePlugIn = plugIn;
-                ctx->nvmeSmartIf = smartIf;
-            } else {
-                IODestroyPlugInInterface(plugIn);
-            }
-        }
     }
 
     if (ctx->blockDriverService == IO_OBJECT_NULL) {
@@ -1271,54 +1487,83 @@ static void xs_sample_storage(XSBridgeContext *ctx, bool refreshSmart, XSStorage
         sto->model[sizeof(sto->model) - 1] = '\0';
     }
 
-    /* 1. NVMe SMART Log Page 0x02 (512 bytes) */
-    if ((refreshSmart || !ctx->hasSmartCache) && ctx->nvmeSmartIf != NULL) {
-        NVMeSMARTData smartData;
-        memset(&smartData, 0, sizeof(smartData));
-
-        IOReturn kr = kIOReturnError;
-        if ((*ctx->nvmeSmartIf)->SMARTReadData != NULL) {
-            kr = (*ctx->nvmeSmartIf)->SMARTReadData(ctx->nvmeSmartIf, &smartData);
-        }
-        if (kr != kIOReturnSuccess && (*ctx->nvmeSmartIf)->GetLogPage != NULL) {
-            kr = (*ctx->nvmeSmartIf)->GetLogPage(
-                ctx->nvmeSmartIf,
-                &smartData,
-                0x02U,
-                (uint32_t)(sizeof(NVMeSMARTData) / 4U) - 1U);
-        }
-
-        if (kr == kIOReturnSuccess) {
-            const uint8_t *buf = (const uint8_t *)&smartData;
-            uint16_t tempK = xs_read_u16_le(buf + 1);
-            XSStorageMetrics cached;
-            memset(&cached, 0, sizeof(cached));
-            cached.hasSmart = (tempK > 0);
-            cached.tempC = (tempK > 0) ? ((int32_t)tempK - 273) : 0;
-            cached.availableSparePct = (int32_t)buf[3];
-            cached.lifeUsedPct = (int32_t)buf[5];
-            cached.dataReadTB = ((double)xs_read_u64_le(buf + 32) * 512000.0) / 1e12;
-            cached.dataWrittenTB = ((double)xs_read_u64_le(buf + 48) * 512000.0) / 1e12;
-            cached.powerCycles = xs_read_u64_le(buf + 112);
-            cached.powerOnHours = xs_read_u64_le(buf + 128);
-            cached.unsafeShutdowns = xs_read_u64_le(buf + 144);
-
-            if (ctx->nvmeModel[0] == '\0' && (*ctx->nvmeSmartIf)->GetIdentifyData != NULL) {
-                NVMeIdentifyControllerStruct idCtrl;
-                memset(&idCtrl, 0, sizeof(idCtrl));
-                if ((*ctx->nvmeSmartIf)->GetIdentifyData(ctx->nvmeSmartIf, &idCtrl, 0) == kIOReturnSuccess) {
-                    xs_trim_copy_cstr(
-                        (const char *)idCtrl.MODEL_NUMBER,
-                        sizeof(idCtrl.MODEL_NUMBER),
-                        ctx->nvmeModel,
-                        sizeof(ctx->nvmeModel));
-                }
+    /* 1. NVMe SMART Log Page 0x02 (512 bytes) — open/close transiently every 30s
+     * so IONVMeSMARTUserClient is never held exclusively across idle/sleep or external tools. */
+    if ((refreshSmart || !ctx->hasSmartCache) && ctx->nvmeBlockService != IO_OBJECT_NULL) {
+        IOCFPlugInInterface **plugIn = NULL;
+        IONVMeSMARTInterface **smartIf = NULL;
+        SInt32 score = 0;
+        if (IOCreatePlugInInterfaceForService(
+                ctx->nvmeBlockService,
+                kIONVMeSMARTUserClientTypeID,
+                kIOCFPlugInInterfaceID,
+                &plugIn,
+                &score) == KERN_SUCCESS &&
+            plugIn != NULL) {
+            HRESULT hr = (*plugIn)->QueryInterface(
+                plugIn,
+                CFUUIDGetUUIDBytes(kIONVMeSMARTInterfaceID),
+                (LPVOID *)&smartIf);
+            if (hr != S_OK || smartIf == NULL) {
+                smartIf = NULL;
+                IODestroyPlugInInterface(plugIn);
+                plugIn = NULL;
             }
-            memcpy(cached.model, ctx->nvmeModel, sizeof(cached.model));
-            cached.model[sizeof(cached.model) - 1] = '\0';
+        }
 
-            ctx->cachedSmart = cached;
-            ctx->hasSmartCache = cached.hasSmart;
+        if (smartIf != NULL) {
+            NVMeSMARTData smartData;
+            memset(&smartData, 0, sizeof(smartData));
+
+            IOReturn kr = kIOReturnError;
+            if ((*smartIf)->SMARTReadData != NULL) {
+                kr = (*smartIf)->SMARTReadData(smartIf, &smartData);
+            }
+            if (kr != kIOReturnSuccess && (*smartIf)->GetLogPage != NULL) {
+                kr = (*smartIf)->GetLogPage(
+                    smartIf,
+                    &smartData,
+                    0x02U,
+                    (uint32_t)(sizeof(NVMeSMARTData) / 4U) - 1U);
+            }
+
+            if (kr == kIOReturnSuccess) {
+                const uint8_t *buf = (const uint8_t *)&smartData;
+                uint16_t tempK = xs_read_u16_le(buf + 1);
+                XSStorageMetrics cached;
+                memset(&cached, 0, sizeof(cached));
+                cached.hasSmart = (tempK > 0);
+                cached.tempC = (tempK > 0) ? ((int32_t)tempK - 273) : 0;
+                cached.availableSparePct = (int32_t)buf[3];
+                cached.lifeUsedPct = (int32_t)buf[5];
+                cached.dataReadTB = ((double)xs_read_u64_le(buf + 32) * 512000.0) / 1e12;
+                cached.dataWrittenTB = ((double)xs_read_u64_le(buf + 48) * 512000.0) / 1e12;
+                cached.powerCycles = xs_read_u64_le(buf + 112);
+                cached.powerOnHours = xs_read_u64_le(buf + 128);
+                cached.unsafeShutdowns = xs_read_u64_le(buf + 144);
+
+                if (ctx->nvmeModel[0] == '\0' && (*smartIf)->GetIdentifyData != NULL) {
+                    NVMeIdentifyControllerStruct idCtrl;
+                    memset(&idCtrl, 0, sizeof(idCtrl));
+                    if ((*smartIf)->GetIdentifyData(smartIf, &idCtrl, 0) == kIOReturnSuccess) {
+                        xs_trim_copy_cstr(
+                            (const char *)idCtrl.MODEL_NUMBER,
+                            sizeof(idCtrl.MODEL_NUMBER),
+                            ctx->nvmeModel,
+                            sizeof(ctx->nvmeModel));
+                    }
+                }
+                memcpy(cached.model, ctx->nvmeModel, sizeof(cached.model));
+                cached.model[sizeof(cached.model) - 1] = '\0';
+
+                ctx->cachedSmart = cached;
+                ctx->hasSmartCache = cached.hasSmart;
+            }
+
+            (*smartIf)->Release(smartIf);
+        }
+        if (plugIn != NULL) {
+            IODestroyPlugInInterface(plugIn);
         }
     }
 
@@ -2007,6 +2252,9 @@ void xs_bridge_reset_baselines(XSBridgeContext *ctx) {
     ctx->s0ixCacheValid = false;
     ctx->powerSampleCount = 0;
     ctx->lastPowerSampleNs = 0;
+    ctx->hasBattRegCache = false;
+    ctx->lastBattRegSampleNs = 0;
+    memset(&ctx->battTracker, 0, sizeof(ctx->battTracker));
     ctx->gpuRegSampleCount = 0;
     ctx->lastGpuRegSampleNs = 0;
     ctx->sinkKnownOnRoot = false;
@@ -2174,7 +2422,7 @@ void xs_bridge_sample_core(
     xs_sample_memory(ctx, &localMem);
 
     /* 5. SmartBattery & S0ixStandby */
-    xs_sample_power_s0ix(ctx, nowMonoNs, &localPwr);
+    xs_sample_power_s0ix(ctx, nowMonoNs, localCpu.packagePowerW, &localPwr);
 
     if (cpu) *cpu = localCpu;
     if (gpu) *gpu = localGpu;

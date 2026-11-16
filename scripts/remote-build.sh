@@ -1,8 +1,8 @@
 #!/bin/bash
 # 在 Linux 开发机上用：把源码同步到测试机 X-STATION V2 并编译或运行测试。
 # 用法：
-#   scripts/remote-build.sh             编译 build/XSensei.app
-#   scripts/remote-build.sh --install   编译并安装启动 /Applications/XSensei.app
+#   scripts/remote-build.sh             编译 build/Xmonitor.app
+#   scripts/remote-build.sh --install   编译并安装启动 /Applications/Xmonitor.app
 #   scripts/remote-build.sh --test      编译并在真机运行 scripts/run-tests.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."

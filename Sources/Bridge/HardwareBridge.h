@@ -78,6 +78,25 @@ typedef struct {
 double xs_calc_rapl_watts(uint64_t prevRaw, uint64_t currRaw, uint8_t esuBits, double dtSec);
 double xs_calc_aperf_mhz(uint64_t deltaAcnt, uint64_t deltaMcnt, double baseMHz);
 double xs_calc_battery_watts(int64_t voltageMV, uint64_t rawInstantAmperage, int32_t *outSignedMA);
+double xs_calc_battery_power(int64_t voltageMV, int64_t designCapacity, uint64_t rawRate, int32_t *outSignedMA);
+
+typedef struct {
+    bool onBatteryActive;
+    int64_t lastRawRate;
+    double anchorWatts;
+    double anchorPkgWatts;
+    uint64_t anchorMonoNs;
+} XSBatteryDischargeTracker;
+
+double xs_step_battery_discharge_tracking(
+    XSBatteryDischargeTracker *tracker,
+    bool isPluggedIn,
+    bool isCharging,
+    bool isFullyCharged,
+    int64_t rawRate,
+    double rawBatteryWatts,
+    double currentPkgWatts,
+    uint64_t nowMonoNs);
 
 typedef struct {
     bool freqProbed;

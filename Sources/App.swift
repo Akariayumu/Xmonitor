@@ -1,18 +1,29 @@
 import AppKit
+import Combine
 import Darwin
 import Foundation
 
 @MainActor
-final class XSenseiAppDelegate: NSObject, NSApplicationDelegate {
+final class XmonitorAppDelegate: NSObject, NSApplicationDelegate {
     private var settings: SettingsStore?
     private var engine: TelemetryEngine?
     private var widgetManager: DesktopWidgetManager?
     private var consoleController: ConsoleWindowController?
     private var statusBarController: StatusBarController?
+    private var cancellables: Set<AnyCancellable> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let settings = SettingsStore()
         let engine = TelemetryEngine(autoStart: true)
+        engine.setAmbientInterval(settings.ambientRefreshInterval)
+
+        settings.$ambientRefreshInterval
+            .receive(on: RunLoop.main)
+            .sink { [weak engine] seconds in
+                engine?.setAmbientInterval(seconds)
+            }
+            .store(in: &cancellables)
+
         let widgetManager = DesktopWidgetManager(engine: engine, settings: settings)
         engine.requiresFastAmbientIoNet = { [weak settings, weak widgetManager] in
             (settings?.showMenuNet ?? false) ||
@@ -30,6 +41,9 @@ final class XSenseiAppDelegate: NSObject, NSApplicationDelegate {
             widgetManager: widgetManager,
             onOpenConsole: { [weak consoleController] in
                 consoleController?.showConsole()
+            },
+            onOpenSettings: { [weak consoleController] in
+                consoleController?.openSettings()
             }
         )
 
@@ -56,8 +70,8 @@ final class XSenseiAppDelegate: NSObject, NSApplicationDelegate {
 
 @main
 @MainActor
-struct XSenseiApp {
-    private static var retainedDelegate: XSenseiAppDelegate?
+struct XmonitorApp {
+    private static var retainedDelegate: XmonitorAppDelegate?
 
     static func main() {
         if CommandLine.arguments.contains("--dump-json") || CommandLine.arguments.contains("--dump-once") {
@@ -85,7 +99,7 @@ struct XSenseiApp {
 
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
-        let delegate = XSenseiAppDelegate()
+        let delegate = XmonitorAppDelegate()
         retainedDelegate = delegate
         app.delegate = delegate
         app.run()

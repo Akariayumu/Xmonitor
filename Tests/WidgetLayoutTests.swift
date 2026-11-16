@@ -168,6 +168,26 @@ func runWidgetLayoutTests() throws {
         "jitter-free rendered pixel width across mid(46°C, KB/s) and high(94°C, MB/s)"
     )
 
+    for style in MenuBarLayoutStyle.allCases {
+        settings.menuBarStyle = style
+        let lowImg = StatusBarController.makeStatusTemplateImage(snapshot: lowSnap, settings: settings)
+        let midImg = StatusBarController.makeStatusTemplateImage(snapshot: midSnap, settings: settings)
+        let highImg = StatusBarController.makeStatusTemplateImage(snapshot: highSnap, settings: settings)
+        try expectEqual(lowImg.isTemplate, true, "status bar image (\(style.rawValue)) uses macOS native template vibrancy tint")
+        try expectEqual(lowImg.size, highImg.size, "zero-jitter (\(style.rawValue)) template image size across low/high metrics")
+        try expectEqual(midImg.size, highImg.size, "zero-jitter (\(style.rawValue)) template image size across mid/high metrics")
+    }
+    settings.menuBarStyle = .stacked
+
+    // Module reorder & ambient interval customization checks
+    settings.moveMenuModule(.temp, by: -1)
+    try expectEqual(settings.menuModuleOrder.first, .temp, "moveMenuModule moves temp ahead of cpu")
+    settings.resetMenuModuleOrder()
+    try expectEqual(settings.menuModuleOrder, MenuBarModule.defaultOrder, "resetMenuModuleOrder restores default order")
+    engine.setAmbientInterval(5.0)
+    try expectEqual(engine.currentInterval, 5.0, "setAmbientInterval updates ambient cadence to 5.0s")
+    engine.setAmbientInterval(2.0)
+
     // 9. All menu items disabled fallback
     settings.showMenuCPU = false
     settings.showMenuGPU = false
@@ -176,7 +196,7 @@ func runWidgetLayoutTests() throws {
     settings.showMenuNet = false
     settings.showMenuTemp = false
     let fallbackAttr = StatusBarController.makeStatusAttributedTitle(snapshot: lowSnap, settings: settings)
-    try expectEqual(fallbackAttr.string, "XSensei", "fallback label when all menu toggles off")
+    try expectEqual(fallbackAttr.string, "Xmonitor", "fallback label when all menu toggles off")
 
     // 9b. Ambient deadband zero-rate transitions & storage capacity/wear checks (headless-safe)
     settings.showMenuCPU = true

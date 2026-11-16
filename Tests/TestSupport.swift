@@ -1,5 +1,43 @@
 import AppKit
+import Darwin
 import Foundation
+import IOKit
+
+func canConnectToAwakeWindowServer() -> Bool {
+    if ProcessInfo.processInfo.environment["XSENSEI_SKIP_GUI_TESTS"] == "1" {
+        return false
+    }
+    var st = stat()
+    guard stat("/dev/console", &st) == 0, st.st_uid == getuid() else {
+        return false
+    }
+    let entry = IORegistryEntryFromPath(kIOMainPortDefault, "IOService:/IOResources/IODisplayWrangler")
+    guard entry != IO_OBJECT_NULL else {
+        return false
+    }
+    defer { IOObjectRelease(entry) }
+    guard let pm = IORegistryEntryCreateCFProperty(
+        entry,
+        "IOPowerManagement" as CFString,
+        kCFAllocatorDefault,
+        0
+    )?.takeRetainedValue() as? [String: Any],
+    let stateNum = pm["CurrentPowerState"] as? NSNumber else {
+        return false
+    }
+    return stateNum.intValue >= 4
+}
+
+@MainActor
+private var didInitTestGUIApp = false
+
+@MainActor
+func ensureTestGUIApplication() {
+    guard !didInitTestGUIApp else { return }
+    didInitTestGUIApp = true
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+}
 
 struct TestFailure: Error, CustomStringConvertible {
     let message: String
@@ -59,9 +97,6 @@ func expectApprox(
 @MainActor
 struct XSenseiTestRunner {
     static func main() {
-        let app = NSApplication.shared
-        app.setActivationPolicy(.accessory)
-
         var failures: [String] = []
 
         do {

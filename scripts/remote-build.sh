@@ -17,23 +17,63 @@ set -a
 set +a
 export SSHPASS="$MAC_PASSWORD"
 REMOTE_DIR=${MAC_DIR:-xsensei}
-SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+SSH_BASE_OPTS=(-o StrictHostKeyChecking=accept-new)
 
-# 双网卡环境下刷新 wlp4s0 到 X-STATION V2 的 ARP 项，确保连接稳定
-ping -c 1 -W 1 -I wlp4s0 $PING_HOST >/dev/null 2>&1 || true
+TARGET_HOST="$MAC_HOST"
+PING_HOST="${TARGET_HOST#*@}"
+PING_HOST="${PING_HOST#[}"
+PING_HOST="${PING_HOST%]}"
 
-echo "==> 同步到 $MAC_HOST:$REMOTE_DIR"
-rsync -az --delete -e "sshpass -e ssh ${SSH_OPTS[*]}" \
+SSH_OPTS=("${SSH_BASE_OPTS[@]}" -o ConnectTimeout=10)
+RSYNC_EXTRA=()
+
+# 双网卡环境下优先绑定 wlp4s0 源地址避免 eno1 路由劫持；若 IPv4 探测失败则自动切换 IPv6 链路本地地址
+if [[ "$PING_HOST" == *:* ]]; then
+    ping -6 -c 1 -W 1 "$PING_HOST" >/dev/null 2>&1 || true
+    SSH_OPTS=(-6 "${SSH_BASE_OPTS[@]}" -o ConnectTimeout=10)
+    RSYNC_EXTRA=(--ipv6)
+else
+    ping -c 1 -W 1 -I wlp4s0 "$PING_HOST" >/dev/null 2>&1 || true
+    WLP_IPV4=$(ip -4 -o addr show dev wlp4s0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1 || true)
+    PROBE_OPTS=("${SSH_BASE_OPTS[@]}" -o ConnectTimeout=3)
+    if [[ -n "$WLP_IPV4" ]]; then
+        PROBE_OPTS+=(-o "BindAddress=$WLP_IPV4")
+    fi
+    if sshpass -e ssh "${PROBE_OPTS[@]}" "$TARGET_HOST" true >/dev/null 2>&1; then
+        if [[ -n "$WLP_IPV4" ]]; then
+            SSH_OPTS+=("-o" "BindAddress=$WLP_IPV4")
+        fi
+    else
+        FALLBACK_IPV6="${MAC_IPV6_HOST:-}"
+        echo "==> IPv4 ($TARGET_HOST) 连接不可达，自动切换 IPv6 链路本地地址: $FALLBACK_IPV6"
+        TARGET_HOST="$FALLBACK_IPV6"
+        SSH_OPTS=(-6 "${SSH_BASE_OPTS[@]}" -o ConnectTimeout=10)
+        RSYNC_EXTRA=(--ipv6)
+    fi
+fi
+
+if [[ "${TARGET_HOST#*@}" == *:* ]]; then
+    RSYNC_USER="${TARGET_HOST%@*}"
+    RSYNC_ADDR="${TARGET_HOST#*@}"
+    RSYNC_ADDR="${RSYNC_ADDR#[}"
+    RSYNC_ADDR="${RSYNC_ADDR%]}"
+    RSYNC_DEST="${RSYNC_USER}@[${RSYNC_ADDR}]:${REMOTE_DIR}/"
+else
+    RSYNC_DEST="${TARGET_HOST}:${REMOTE_DIR}/"
+fi
+
+echo "==> 同步到 $TARGET_HOST:$REMOTE_DIR"
+rsync -az "${RSYNC_EXTRA[@]}" --delete -e "sshpass -e ssh ${SSH_OPTS[*]}" \
     --exclude .git --exclude build --exclude .testmac.env --exclude .superpowers \
-    ./ "$MAC_HOST:$REMOTE_DIR/"
+    ./ "$RSYNC_DEST"
 
 if [[ "${1:-}" == "--test" ]]; then
     shift
     echo "==> 在测试机上编译并运行测试"
-    printf '%s\n' "$MAC_PASSWORD" | sshpass -e ssh "${SSH_OPTS[@]}" "$MAC_HOST" \
+    printf '%s\n' "$MAC_PASSWORD" | sshpass -e ssh "${SSH_OPTS[@]}" "$TARGET_HOST" \
         "read -r PW; security unlock-keychain -p \"\$PW\" login.keychain-db 2>/dev/null || true; cd $REMOTE_DIR && scripts/run-tests.sh $*"
 else
     echo "==> 在测试机上编译应用"
-    printf '%s\n' "$MAC_PASSWORD" | sshpass -e ssh "${SSH_OPTS[@]}" "$MAC_HOST" \
+    printf '%s\n' "$MAC_PASSWORD" | sshpass -e ssh "${SSH_OPTS[@]}" "$TARGET_HOST" \
         "read -r PW; security unlock-keychain -p \"\$PW\" login.keychain-db 2>/dev/null || true; cd $REMOTE_DIR && scripts/build-app.sh $*"
 fi

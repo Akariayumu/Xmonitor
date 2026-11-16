@@ -197,7 +197,7 @@ final class DesktopWidgetManager: ObservableObject {
         )
         panel.onFrameCommitted = { [weak self, weak panel] committedFrame in
             guard let self else { return }
-            let vf = (panel?.screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+            let vf = (panel?.screen ?? NSScreen.screens.first ?? NSScreen.main)?.visibleFrame
                 ?? self.currentVisibleFrame()
             let norm = WidgetLayoutMath.normalizedOrigin(for: committedFrame, in: vf)
             self.storeNormalizedOrigin(norm, for: kind)
@@ -265,7 +265,7 @@ final class DesktopWidgetManager: ObservableObject {
     }
 
     private func currentVisibleFrame() -> CGRect {
-        if let vf = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame,
+        if let vf = (NSScreen.screens.first ?? NSScreen.main)?.visibleFrame,
            vf.width > 0, vf.height > 0 {
             return vf
         }

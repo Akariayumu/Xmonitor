@@ -22,6 +22,8 @@ final class TelemetryEngine: ObservableObject {
     private static let smartRefreshSeconds: TimeInterval = 30.0
     private static let volumeRefreshSeconds: TimeInterval = 30.0
     private static let ambientWifiRefreshSeconds: TimeInterval = 60.0
+    private static let unassociatedWifiRetrySeconds: TimeInterval = 6.0
+    private static let postWakeSampleDelaySeconds: TimeInterval = 0.4
 
     @Published private(set) var snapshot: SystemSnapshot = .empty
     private(set) var cpuHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
@@ -33,6 +35,7 @@ final class TelemetryEngine: ObservableObject {
     private(set) var diskReadHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
     private(set) var diskWriteHistory = FixedRingBuffer<Double>(capacity: historyCapacity, repeating: 0)
     @Published private(set) var currentInterval: TimeInterval = ambientInterval
+    private(set) var wakeResetCount: Int = 0
     var requiresFastAmbientIoNet: (() -> Bool)?
 
     private nonisolated let cleanupBox: EngineCleanupBox
@@ -40,6 +43,7 @@ final class TelemetryEngine: ObservableObject {
 
     private let autoStart: Bool
     private var timer: Timer?
+    private var wakeDebounceTimer: Timer?
     private var interactiveTokens: Set<UUID> = []
     private var isSystemSleeping = false
     private var isScreenSleeping = false
@@ -103,28 +107,42 @@ final class TelemetryEngine: ObservableObject {
 
     func handleSleep() {
         isSystemSleeping = true
+        invalidateWakeDebounceTimer()
         applySchedule(triggerImmediateSample: false)
     }
 
     func handleWake() {
+        let wasSuspended = isSuspended
         isSystemSleeping = false
-        if isScreenSleeping && CGDisplayIsAsleep(CGMainDisplayID()) == 0 {
+        if autoStart && isScreenSleeping && CGDisplayIsAsleep(CGMainDisplayID()) == 0 {
             isScreenSleeping = false
         }
-        resetBaselinesForWake()
-        applySchedule(triggerImmediateSample: autoStart && !isSuspended)
+        if wasSuspended && !isSuspended {
+            resetBaselinesForWake()
+            applySchedule(triggerImmediateSample: false)
+            schedulePostWakeSampleIfNeeded()
+        } else {
+            applySchedule(triggerImmediateSample: false)
+        }
     }
 
-    private func handleScreenSleep() {
+    func handleScreenSleep() {
         isScreenSleeping = true
+        invalidateWakeDebounceTimer()
         applySchedule(triggerImmediateSample: false)
     }
 
-    private func handleScreenWake() {
+    func handleScreenWake() {
+        let wasSuspended = isSuspended
         isScreenSleeping = false
         isSystemSleeping = false
-        resetBaselinesForWake()
-        applySchedule(triggerImmediateSample: autoStart)
+        if wasSuspended && !isSuspended {
+            resetBaselinesForWake()
+            applySchedule(triggerImmediateSample: false)
+            schedulePostWakeSampleIfNeeded()
+        } else {
+            applySchedule(triggerImmediateSample: false)
+        }
     }
 
     private var isSuspended: Bool {
@@ -132,6 +150,7 @@ final class TelemetryEngine: ObservableObject {
     }
 
     private func resetBaselinesForWake() {
+        wakeResetCount += 1
         if let bridgeCtx {
             xs_bridge_reset_baselines(bridgeCtx)
         }
@@ -139,6 +158,26 @@ final class TelemetryEngine: ObservableObject {
         lastVolumeRefreshUptime = 0
         lastWifiRefreshUptime = 0
         lastIoNetRefreshUptime = 0
+    }
+
+    private func schedulePostWakeSampleIfNeeded() {
+        guard autoStart, !isSuspended else { return }
+        invalidateWakeDebounceTimer()
+        let oneShot = Timer(timeInterval: Self.postWakeSampleDelaySeconds, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, !self.isSuspended else { return }
+                self.wakeDebounceTimer = nil
+                self.refreshNow()
+            }
+        }
+        oneShot.tolerance = 0.05
+        RunLoop.main.add(oneShot, forMode: .common)
+        wakeDebounceTimer = oneShot
+    }
+
+    private func invalidateWakeDebounceTimer() {
+        wakeDebounceTimer?.invalidate()
+        wakeDebounceTimer = nil
     }
 
     private func applySchedule(triggerImmediateSample: Bool) {
@@ -184,6 +223,7 @@ final class TelemetryEngine: ObservableObject {
     private func invalidateTimer() {
         timer?.invalidate()
         timer = nil
+        invalidateWakeDebounceTimer()
     }
 
     private func registerWorkspaceObservers() {
@@ -214,9 +254,12 @@ final class TelemetryEngine: ObservableObject {
         let uptime = Self.systemUptimeSeconds()
         let isInteractive = !interactiveTokens.isEmpty
 
+        let wifiInterval: TimeInterval = (!cachedWifi.isAssociated && (!hasSampledOnce || (cachedWifi.isPresent && cachedWifi.isPoweredOn)))
+            ? Self.unassociatedWifiRetrySeconds
+            : Self.ambientWifiRefreshSeconds
         let shouldRefreshWifi = !hasSampledOnce ||
             isInteractive ||
-            (uptime - lastWifiRefreshUptime >= Self.ambientWifiRefreshSeconds)
+            (uptime - lastWifiRefreshUptime >= wifiInterval)
         if shouldRefreshWifi {
             let queryIdentity = !hasSampledOnce || isInteractive || (cachedWifi.ssid != nil) || !cachedWifi.isAssociated
             cachedWifi = Self.sampleWifi(queryIdentity: queryIdentity, previous: cachedWifi)
@@ -286,8 +329,12 @@ final class TelemetryEngine: ObservableObject {
             netSnap = NetworkSnapshot(c: cNet)
         } else {
             var reusedSto = snapshot.storage
+            let clampedAvail = min(cachedVolumeAvailableBytes, cachedVolumeTotalBytes)
             reusedSto.totalBytes = cachedVolumeTotalBytes
-            reusedSto.availableBytes = cachedVolumeAvailableBytes
+            reusedSto.availableBytes = clampedAvail
+            reusedSto.usedBytes = cachedVolumeTotalBytes >= clampedAvail
+                ? (cachedVolumeTotalBytes - clampedAvail)
+                : 0
             stoSnap = reusedSto
             netSnap = snapshot.network
         }
@@ -333,23 +380,14 @@ final class TelemetryEngine: ObservableObject {
         return ProcessInfo.processInfo.systemUptime
     }
 
-    private static func sampleRootVolumeCapacity() -> (total: UInt64, available: UInt64) {
-        let rootURL = URL(fileURLWithPath: "/")
-        let keys: Set<URLResourceKey> = [
-            .volumeTotalCapacityKey,
-            .volumeAvailableCapacityForImportantUsageKey,
-            .volumeAvailableCapacityKey
-        ]
-        guard let vals = try? rootURL.resourceValues(forKeys: keys) else {
+    static func sampleRootVolumeCapacity() -> (total: UInt64, available: UInt64) {
+        var sfs = statfs()
+        guard statfs("/", &sfs) == 0 else {
             return (0, 0)
         }
-        let total = UInt64(max(0, vals.volumeTotalCapacity ?? 0))
-        let avail: UInt64
-        if let important = vals.volumeAvailableCapacityForImportantUsage, important > 0 {
-            avail = UInt64(important)
-        } else {
-            avail = UInt64(max(0, vals.volumeAvailableCapacity ?? 0))
-        }
+        let bsize = UInt64(sfs.f_bsize)
+        let total = sfs.f_blocks.multipliedReportingOverflow(by: bsize).partialValue
+        let avail = sfs.f_bavail.multipliedReportingOverflow(by: bsize).partialValue
         return (total, min(avail, total))
     }
 

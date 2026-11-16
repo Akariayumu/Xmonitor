@@ -248,13 +248,18 @@ final class ConsoleWindowController: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         releaseInteractiveSessionIfNeeded()
-        window?.contentView = nil
-        window?.delegate = nil
-        window = nil
-        NSApp.setActivationPolicy(.accessory)
-        widgetManager.refreshVisibilityAndFrames()
-        Task { @MainActor [weak self] in
-            self?.widgetManager.refreshVisibilityAndFrames()
+        let closingWindow = (notification.object as? NSWindow) ?? window
+        closingWindow?.delegate = nil
+        if window === closingWindow {
+            window = nil
+        }
+        DispatchQueue.main.async { [weak self, closingWindow] in
+            closingWindow?.contentView = NSView()
+            guard let self else { return }
+            if self.window == nil {
+                NSApp.setActivationPolicy(.accessory)
+            }
+            self.widgetManager.refreshVisibilityAndFrames()
         }
     }
 

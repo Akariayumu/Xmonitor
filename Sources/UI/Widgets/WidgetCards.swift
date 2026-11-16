@@ -586,7 +586,10 @@ final class WidgetCardCanvasNSView: NSView {
         if !chromeChanged,
            engine.currentInterval >= 1.9,
            let prev = lastDisplayedSnapshot,
-           isWithinAmbientDeadband(prev: prev, curr: snapshot) {
+           Self.isWithinAmbientDeadband(kind: kind, prev: prev, curr: snapshot) {
+            let pad: CGFloat = (preset == .compact) ? 11.0 : 14.0
+            let rect = b.insetBy(dx: pad, dy: pad)
+            updateSparklinesOnly(rect: rect, preset: preset, engine: engine, isDark: isDark)
             return
         }
         lastDisplayedSnapshot = snapshot
@@ -640,10 +643,16 @@ final class WidgetCardCanvasNSView: NSView {
         lastIsDark = nil
     }
 
-    private func isWithinAmbientDeadband(prev: SystemSnapshot, curr: SystemSnapshot) -> Bool {
+    static func isWithinAmbientDeadband(
+        kind: DesktopWidgetKind,
+        prev: SystemSnapshot,
+        curr: SystemSnapshot
+    ) -> Bool {
         if prev.cpu.maxFreqMHz == 0 && curr.cpu.maxFreqMHz > 0 { return false }
         switch kind {
         case .cpuGpu:
+            if prev.cpu.totalUsage >= 0.5 && curr.cpu.totalUsage < 0.5 { return false }
+            if prev.gpu.usagePct >= 0.5 && curr.gpu.usagePct < 0.5 { return false }
             return abs(curr.cpu.totalUsage - prev.cpu.totalUsage) < 2.5 &&
                 abs(curr.cpu.maxFreqMHz - prev.cpu.maxFreqMHz) < 250.0 &&
                 abs(curr.cpu.packagePowerW - prev.cpu.packagePowerW) < 0.5 &&
@@ -654,12 +663,17 @@ final class WidgetCardCanvasNSView: NSView {
                 abs(curr.gpu.usagePct - prev.gpu.usagePct) < 2.0 &&
                 abs(curr.gpu.powerW - prev.gpu.powerW) < 0.3 &&
                 curr.gpu.hasFreq == prev.gpu.hasFreq &&
-                curr.gpu.currentFreqMHz == prev.gpu.currentFreqMHz
+                curr.gpu.currentFreqMHz == prev.gpu.currentFreqMHz &&
+                (curr.gpu.gartUsedBytes >> 25) == (prev.gpu.gartUsedBytes >> 25)
         case .memoryStorage:
+            if prev.storage.readBytesPerSec > 0 && curr.storage.readBytesPerSec == 0 { return false }
+            if prev.storage.writeBytesPerSec > 0 && curr.storage.writeBytesPerSec == 0 { return false }
             return abs(Int64(curr.memory.usedBytes) - Int64(prev.memory.usedBytes)) < 33_554_432 &&
                 curr.memory.pressureLevel == prev.memory.pressureLevel &&
                 curr.storage.hasSmart == prev.storage.hasSmart &&
                 curr.storage.tempC == prev.storage.tempC &&
+                curr.storage.lifeUsedPct == prev.storage.lifeUsedPct &&
+                (curr.storage.availableBytes >> 26) == (prev.storage.availableBytes >> 26) &&
                 abs(Int64(curr.storage.readBytesPerSec) - Int64(prev.storage.readBytesPerSec)) < 16_384 &&
                 abs(Int64(curr.storage.writeBytesPerSec) - Int64(prev.storage.writeBytesPerSec)) < 16_384
         case .powerS0ix:
@@ -670,12 +684,87 @@ final class WidgetCardCanvasNSView: NSView {
                 curr.power.cycleCount == prev.power.cycleCount &&
                 abs(curr.power.batteryWatts - prev.power.batteryWatts) < 0.4 &&
                 abs(curr.cpu.packagePowerW - prev.cpu.packagePowerW) < 0.5 &&
-                curr.power.sleepCount == prev.power.sleepCount
+                curr.power.hasS0ix == prev.power.hasS0ix &&
+                curr.power.lastCC7Pct == prev.power.lastCC7Pct &&
+                curr.power.lastPC8Pct == prev.power.lastPC8Pct &&
+                curr.power.lastDC9 == prev.power.lastDC9 &&
+                curr.power.sleepCount == prev.power.sleepCount &&
+                curr.power.lastWakeSource == prev.power.lastWakeSource
         case .network:
+            if prev.network.rxBytesPerSec > 0 && curr.network.rxBytesPerSec == 0 { return false }
+            if prev.network.txBytesPerSec > 0 && curr.network.txBytesPerSec == 0 { return false }
             return abs(Int64(curr.network.rxBytesPerSec) - Int64(prev.network.rxBytesPerSec)) < 4_096 &&
                 abs(Int64(curr.network.txBytesPerSec) - Int64(prev.network.txBytesPerSec)) < 4_096 &&
+                curr.network.ipv4 == prev.network.ipv4 &&
                 curr.wifi.isAssociated == prev.wifi.isAssociated &&
+                curr.wifi.ssid == prev.wifi.ssid &&
+                abs(curr.wifi.txRateMbps - prev.wifi.txRateMbps) < 50 &&
                 abs(curr.wifi.rssi - prev.wifi.rssi) < 3
+        }
+    }
+
+    private func updateSparklinesOnly(
+        rect: CGRect,
+        preset: WidgetSizePreset,
+        engine: TelemetryEngine,
+        isDark: Bool
+    ) {
+        guard preset != .compact else { return }
+        switch kind {
+        case .cpuGpu:
+            if preset == .standard {
+                sparkline(at: 0).configure(
+                    frame: CGRect(x: rect.minX, y: rect.maxY - 36, width: rect.width, height: 36),
+                    values: engine.cpuHistory.values,
+                    maxValue: 100,
+                    accent: .cyan,
+                    isDark: isDark
+                )
+            } else if preset == .wide {
+                let halfW = (rect.width - 10) * 0.5
+                sparkline(at: 0).configure(
+                    frame: CGRect(x: rect.minX, y: rect.maxY - 38, width: halfW, height: 38),
+                    values: engine.cpuHistory.values,
+                    maxValue: 100,
+                    accent: .cyan,
+                    isDark: isDark
+                )
+                sparkline(at: 1).configure(
+                    frame: CGRect(x: rect.minX + halfW + 10, y: rect.maxY - 38, width: halfW, height: 38),
+                    values: engine.gpuHistory.values,
+                    maxValue: 100,
+                    accent: .indigo,
+                    isDark: isDark
+                )
+            }
+        case .network:
+            if preset == .standard {
+                sparkline(at: 0).configure(
+                    frame: CGRect(x: rect.minX, y: rect.maxY - 40, width: rect.width, height: 40),
+                    values: engine.netRxHistory.values,
+                    maxValue: nil,
+                    accent: .cyan,
+                    isDark: isDark
+                )
+            } else if preset == .wide {
+                let halfW = (rect.width - 10) * 0.5
+                sparkline(at: 0).configure(
+                    frame: CGRect(x: rect.minX, y: rect.maxY - 42, width: halfW, height: 42),
+                    values: engine.netRxHistory.values,
+                    maxValue: nil,
+                    accent: .cyan,
+                    isDark: isDark
+                )
+                sparkline(at: 1).configure(
+                    frame: CGRect(x: rect.minX + halfW + 10, y: rect.maxY - 42, width: halfW, height: 42),
+                    values: engine.netTxHistory.values,
+                    maxValue: nil,
+                    accent: .emerald,
+                    isDark: isDark
+                )
+            }
+        case .memoryStorage, .powerS0ix:
+            break
         }
     }
 

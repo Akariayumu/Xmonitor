@@ -279,7 +279,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         if engine.currentInterval >= 1.9,
            let prev = lastDisplayedSnapshot,
-           isWithinAmbientDeadband(prev: prev, curr: snapshot) {
+           Self.isWithinAmbientDeadband(prev: prev, curr: snapshot, settings: settings) {
             return
         }
         lastDisplayedSnapshot = snapshot
@@ -301,9 +301,14 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         }
     }
 
-    private func isWithinAmbientDeadband(prev: SystemSnapshot, curr: SystemSnapshot) -> Bool {
+    static func isWithinAmbientDeadband(
+        prev: SystemSnapshot,
+        curr: SystemSnapshot,
+        settings: SettingsStore
+    ) -> Bool {
         if prev.cpu.maxFreqMHz == 0 && curr.cpu.maxFreqMHz > 0 { return false }
         if settings.showMenuCPU {
+            if prev.cpu.totalUsage >= 0.5 && curr.cpu.totalUsage < 0.5 { return false }
             if abs(curr.cpu.totalUsage - prev.cpu.totalUsage) >= 2.5 { return false }
             if abs(curr.cpu.maxFreqMHz - prev.cpu.maxFreqMHz) >= 250.0 { return false }
         }
@@ -312,17 +317,27 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             if curr.cpu.hasTemp && abs(curr.cpu.packageTempC - prev.cpu.packageTempC) >= 1.5 { return false }
         }
         if settings.showMenuGPU {
+            if prev.gpu.usagePct >= 0.5 && curr.gpu.usagePct < 0.5 { return false }
             if abs(curr.gpu.usagePct - prev.gpu.usagePct) >= 2.0 { return false }
         }
         if settings.showMenuRAM {
             if abs(curr.memory.usedPercent - prev.memory.usedPercent) >= 1.5 { return false }
         }
         if settings.showMenuPower {
-            let w0 = Self.resolvedMenuWatts(snapshot: prev)
-            let w1 = Self.resolvedMenuWatts(snapshot: curr)
+            let w0 = resolvedMenuWatts(snapshot: prev)
+            let w1 = resolvedMenuWatts(snapshot: curr)
+            if w0 >= 0.05 && w1 < 0.05 { return false }
             if abs(w1 - w0) >= 0.5 { return false }
         }
         if settings.showMenuNet {
+            if (prev.network.rxBytesPerSec > 0 && curr.network.rxBytesPerSec == 0) ||
+                ((prev.network.rxBytesPerSec >= 512) != (curr.network.rxBytesPerSec >= 512)) {
+                return false
+            }
+            if (prev.network.txBytesPerSec > 0 && curr.network.txBytesPerSec == 0) ||
+                ((prev.network.txBytesPerSec >= 512) != (curr.network.txBytesPerSec >= 512)) {
+                return false
+            }
             if abs(Int64(curr.network.rxBytesPerSec) - Int64(prev.network.rxBytesPerSec)) >= 4096 { return false }
             if abs(Int64(curr.network.txBytesPerSec) - Int64(prev.network.txBytesPerSec)) >= 4096 { return false }
         }

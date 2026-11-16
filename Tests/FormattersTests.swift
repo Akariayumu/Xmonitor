@@ -93,7 +93,15 @@ func runFormattersTests() throws {
     let normEmpty = AreaSparkline.normalizedSamples(values: [], maxValue: nil)
     try expectEqual(normEmpty, [0.0, 0.0], "empty sparkline produces flat 2-point baseline")
 
-    // 9. Smoke-render all SwiftUI theme components inside NSHostingView (verifies exact init signatures & layout)
+    // 8b. ConsoleFormat non-finite guards
+    try expectEqual(ConsoleFormat.percent1(.nan), "0.0%", "ConsoleFormat percent1 NaN guard")
+    try expectEqual(ConsoleFormat.percentInt(.nan), "0%", "ConsoleFormat percentInt NaN guard")
+    try expectEqual(ConsoleFormat.mhzInt(.infinity), "0 MHz", "ConsoleFormat mhzInt Inf guard")
+    try expectEqual(ConsoleFormat.ghz(.nan), "0.00 GHz", "ConsoleFormat ghz NaN guard")
+    try expectEqual(ConsoleFormat.watts2(.nan), "0.00 W", "ConsoleFormat watts2 NaN guard")
+    try expectEqual(ConsoleFormat.signedWatts(.nan), "0.0 W", "ConsoleFormat signedWatts NaN guard")
+
+    // 9. Smoke-render all SwiftUI theme components inside NSHostingView (gated on awake WindowServer)
     var ringBuf = FixedRingBuffer<Double>(capacity: 60, repeating: 0)
     for i in 0..<60 {
         ringBuf.append(Double(i))
@@ -117,8 +125,13 @@ func runFormattersTests() throws {
     }
     .preferredColorScheme(SenseiPalette.colorScheme(for: .darkGraphite))
 
-    let hosting = NSHostingView(rootView: compositeView)
-    hosting.frame = CGRect(x: 0, y: 0, width: 240, height: 220)
-    hosting.layoutSubtreeIfNeeded()
-    try expectTrue(hosting.fittingSize.width > 0 && hosting.fittingSize.height > 0, "SwiftUI GlassCard/RingGauge/AreaSparkline layout valid")
+    if canConnectToAwakeWindowServer() {
+        ensureTestGUIApplication()
+        let hosting = NSHostingView(rootView: compositeView)
+        hosting.frame = CGRect(x: 0, y: 0, width: 240, height: 220)
+        hosting.layoutSubtreeIfNeeded()
+        try expectTrue(hosting.fittingSize.width > 0 && hosting.fittingSize.height > 0, "SwiftUI GlassCard/RingGauge/AreaSparkline layout valid")
+    } else {
+        print("[SKIP] GUI WindowServer asleep or console not owned by uid (FormattersTests NSHostingView)")
+    }
 }

@@ -83,8 +83,28 @@ func runEngineAndCollectorsTests() throws {
     try expectEqual(engine.currentInterval, 0.0, "stays 0 Hz while asleep even if session acquired")
     engine.handleWake()
     try expectEqual(engine.currentInterval, 1.0, "resumes at 1.0s on wake when interactive session open")
+    try expectEqual(engine.wakeResetCount, 1, "first suspended->awake transition resets baselines once")
+    // Duplicate wake / screenWake while already awake must NOT reset baselines again
+    engine.handleWake()
+    engine.handleScreenWake()
+    try expectEqual(engine.wakeResetCount, 1, "duplicate wake notifications while awake do not re-reset baselines")
+    // System wake while screen still asleep stays suspended (0 Hz) without resetting until screen wakes
+    engine.handleSleep()
+    engine.handleScreenSleep()
+    try expectEqual(engine.currentInterval, 0.0, "0 Hz when both system and screen asleep")
+    engine.handleWake()
+    try expectEqual(engine.currentInterval, 0.0, "stays 0 Hz after system wake while screen still asleep")
+    try expectEqual(engine.wakeResetCount, 1, "does not reset baselines while screen still asleep")
+    engine.handleScreenWake()
+    try expectEqual(engine.currentInterval, 1.0, "resumes 1.0s once screen wakes")
+    try expectEqual(engine.wakeResetCount, 2, "resets baselines exactly once when screen wakes")
     engine.endInteractiveSession(t3)
     try expectEqual(engine.currentInterval, 2.0, "returns to 2.0s after post-wake session ends")
+
+    // 2b. Zero-XPC statfs("/") volume capacity & reusedSto.usedBytes recomputation
+    let rootCap = TelemetryEngine.sampleRootVolumeCapacity()
+    try expectTrue(rootCap.total > 100_000_000_000, "statfs('/') total > 100 GB: \(rootCap.total)")
+    try expectTrue(rootCap.available > 0 && rootCap.available <= rootCap.total, "statfs('/') available sane: \(rootCap.available)")
 
     // 3. Live NVMe SMART + Network + Process collector check
     let ctx = xs_bridge_create()!
@@ -110,10 +130,17 @@ func runEngineAndCollectorsTests() throws {
     var fullProcs = [XSProcessEntry](repeating: XSProcessEntry(), count: 512)
     let fullCount = Int(xs_bridge_sample_processes(ctx, &fullProcs, 512, &allUsers))
     let fullNames = fullProcs.prefix(fullCount).map { decodeFixedCString($0.name) }
-    try expectTrue(
-        fullCount >= 60 && (fullNames.contains("Finder") || fullNames.contains("Dock")),
-        "full PID scan includes early session processes (count=\(fullCount))"
-    )
+    if canConnectToAwakeWindowServer() {
+        try expectTrue(
+            fullCount >= 60 && (fullNames.contains("Finder") || fullNames.contains("Dock")),
+            "full PID scan includes early session processes (count=\(fullCount))"
+        )
+    } else {
+        try expectTrue(
+            fullCount >= 5 && fullNames.contains("XSenseiTests"),
+            "headless PID scan includes current user processes (count=\(fullCount))"
+        )
+    }
 
     // 4. Mach port & COM plugin refcount hygiene across repeated IO/Net/Process ticks & lifecycles
     for _ in 0..<5 {
@@ -153,6 +180,18 @@ func runEngineAndCollectorsTests() throws {
     let jsonData = try JSONEncoder().encode(snap)
     let decoded = try JSONDecoder().decode(SystemSnapshot.self, from: jsonData)
     try expectEqual(decoded.storage.tempC, snap.storage.tempC, "SystemSnapshot JSON roundtrip")
+
+    // Verify ambient reusedSto path recomputes usedBytes = totalBytes - availableBytes
+    engine.endInteractiveSession(tSnap)
+    engine.requiresFastAmbientIoNet = { false }
+    engine.refreshNow()
+    let ambientSto = engine.snapshot.storage
+    try expectEqual(
+        ambientSto.usedBytes,
+        ambientSto.totalBytes >= ambientSto.availableBytes ? (ambientSto.totalBytes - ambientSto.availableBytes) : 0,
+        "ambient reusedSto recomputes usedBytes accurately"
+    )
+    engine.requiresFastAmbientIoNet = nil
 
     let topSummary = snap.topProcesses.prefix(3).map {
         String(format: "%@(pid=%d,%.1f%%,%.0fMB)", $0.name, $0.pid, $0.cpuPct, Double($0.memoryBytes) / 1_048_576.0)

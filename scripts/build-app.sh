@@ -105,6 +105,10 @@ if [[ "${1:-}" == "--install" ]]; then
     done
     rm -rf /Applications/XSensei.app
     cp -R "$APP" /Applications/
-    open -a /Applications/XSensei.app
-    echo "==> 已安装并启动 /Applications/XSensei.app"
+    if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+        open /Applications/XSensei.app
+        echo "==> 已安装并启动 /Applications/XSensei.app"
+    else
+        echo "==> 已更新 /Applications/XSensei.app（当前未登录 GUI 会话 gui/$(id -u)，下次登录桌面时即可运行）"
+    fi
 fi

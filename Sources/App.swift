@@ -60,7 +60,7 @@ struct XSenseiApp {
     private static var retainedDelegate: XSenseiAppDelegate?
 
     static func main() {
-        if CommandLine.arguments.contains("--dump-json") {
+        if CommandLine.arguments.contains("--dump-json") || CommandLine.arguments.contains("--dump-once") {
             let engine = TelemetryEngine(autoStart: false)
             let token = engine.beginInteractiveSession()
             engine.refreshNow()

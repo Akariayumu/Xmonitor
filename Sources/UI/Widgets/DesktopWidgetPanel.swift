@@ -319,6 +319,6 @@ final class DesktopWidgetPanel: NSPanel {
     }
 
     private var activeVisibleFrame: CGRect? {
-        (screen ?? NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+        (screen ?? NSScreen.screens.first ?? NSScreen.main)?.visibleFrame
     }
 }

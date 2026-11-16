@@ -178,61 +178,150 @@ func runWidgetLayoutTests() throws {
     let fallbackAttr = StatusBarController.makeStatusAttributedTitle(snapshot: lowSnap, settings: settings)
     try expectEqual(fallbackAttr.string, "XSensei", "fallback label when all menu toggles off")
 
-    // 10. DesktopWidgetPanel level, collectionBehavior, styleMask & click-through lock contract
-    let testPanel = DesktopWidgetPanel(
-        kind: .cpuGpu,
-        initialFrame: CGRect(x: 100, y: 100, width: 320, height: 192),
-        locked: true,
-        themeMode: .darkGraphite,
-        rootView: EmptyView()
-    )
-    let expectedLevel = Int(CGWindowLevelForKey(.desktopIconWindow)) + 1
-    try expectEqual(testPanel.level.rawValue, expectedLevel, "wallpaper-above-icons window level")
-    try expectTrue(
-        testPanel.collectionBehavior.contains([.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]),
-        "panel collectionBehavior includes all 4 desktop stationary flags"
-    )
-    try expectTrue(
-        testPanel.styleMask.contains([.borderless, .nonactivatingPanel]),
-        "panel styleMask is borderless nonactivatingPanel"
-    )
-    try expectEqual(testPanel.ignoresMouseEvents, true, "locked panel clicks through")
-    testPanel.applyLockState(false)
-    try expectEqual(testPanel.ignoresMouseEvents, false, "unlocked panel accepts mouse events for snap-drag")
-    testPanel.close()
+    // 9b. Ambient deadband zero-rate transitions & storage capacity/wear checks (headless-safe)
+    settings.showMenuCPU = true
+    settings.showMenuGPU = true
+    settings.showMenuRAM = true
+    settings.showMenuPower = true
+    settings.showMenuNet = true
 
-    // 10b. Live DesktopWidgetManager panel resize (.wide -> .compact) & cleanup
-    let liveSuiteName = "com.xstation.sensei.livepanel.tests.\(UUID().uuidString)"
-    let liveDefaults = UserDefaults(suiteName: liveSuiteName)!
-    defer { liveDefaults.removePersistentDomain(forName: liveSuiteName) }
-    let liveSettings = SettingsStore(defaults: liveDefaults)
-    let liveManager = DesktopWidgetManager(engine: engine, settings: liveSettings)
-    liveManager.setSizePreset(.wide, for: .cpuGpu)
+    var prevAmbient = lowSnap
+    prevAmbient.cpu.maxFreqMHz = 900
+    prevAmbient.cpu.packagePowerW = 1.4
+    prevAmbient.network.rxBytesPerSec = 3_072
+    prevAmbient.network.txBytesPerSec = 2_048
+    prevAmbient.storage.readBytesPerSec = 12_288
+    prevAmbient.storage.writeBytesPerSec = 8_192
+    prevAmbient.storage.availableBytes = 250 * 1_073_741_824
+    prevAmbient.storage.lifeUsedPct = 1
+
+    var tinyJitter = prevAmbient
+    tinyJitter.cpu.maxFreqMHz = 960
+    tinyJitter.cpu.packagePowerW = 1.5
+    tinyJitter.network.rxBytesPerSec = 3_500
+    tinyJitter.network.txBytesPerSec = 2_200
+    tinyJitter.storage.readBytesPerSec = 10_000
+    tinyJitter.storage.writeBytesPerSec = 9_000
     try expectEqual(
-        liveManager.activePanel(for: .cpuGpu)?.frame.size,
-        DesktopWidgetKind.cpuGpu.size(for: .wide),
-        "live panel resizes up to .wide"
+        StatusBarController.isWithinAmbientDeadband(prev: prevAmbient, curr: tinyJitter, settings: settings),
+        true,
+        "menu bar suppresses sub-threshold ambient LSB noise"
     )
-    liveManager.setSizePreset(.compact, for: .cpuGpu)
     try expectEqual(
-        liveManager.activePanel(for: .cpuGpu)?.frame.size,
-        DesktopWidgetKind.cpuGpu.size(for: .compact),
-        "live panel shrinks cleanly down to .compact without NSHostingView minSize clamp"
+        WidgetCardCanvasNSView.isWithinAmbientDeadband(kind: .network, prev: prevAmbient, curr: tinyJitter),
+        true,
+        "network widget suppresses sub-threshold ambient noise"
     )
-    for kind in DesktopWidgetKind.allCases {
-        liveManager.setWidgetEnabled(kind, enabled: false)
+    try expectEqual(
+        WidgetCardCanvasNSView.isWithinAmbientDeadband(kind: .memoryStorage, prev: prevAmbient, curr: tinyJitter),
+        true,
+        "memoryStorage widget suppresses sub-threshold ambient noise"
+    )
+
+    var netZeroDrop = prevAmbient
+    netZeroDrop.network.rxBytesPerSec = 0
+    try expectEqual(
+        StatusBarController.isWithinAmbientDeadband(prev: prevAmbient, curr: netZeroDrop, settings: settings),
+        false,
+        "menu bar never sticks on non-zero rx rate when dropping to 0 B/s"
+    )
+    try expectEqual(
+        WidgetCardCanvasNSView.isWithinAmbientDeadband(kind: .network, prev: prevAmbient, curr: netZeroDrop),
+        false,
+        "network widget never sticks on non-zero rx rate when dropping to 0 B/s"
+    )
+
+    var menuSubKBZeroDrop = prevAmbient
+    menuSubKBZeroDrop.network.rxBytesPerSec = 120 // rounds to 0K while prev was 3K
+    try expectEqual(
+        StatusBarController.isWithinAmbientDeadband(prev: prevAmbient, curr: menuSubKBZeroDrop, settings: settings),
+        false,
+        "menu bar flushes 3K -> 0K sub-512B/s rounding drop"
+    )
+
+    var diskZeroDrop = prevAmbient
+    diskZeroDrop.storage.writeBytesPerSec = 0
+    try expectEqual(
+        WidgetCardCanvasNSView.isWithinAmbientDeadband(kind: .memoryStorage, prev: prevAmbient, curr: diskZeroDrop),
+        false,
+        "memoryStorage widget never sticks on non-zero write rate when dropping to 0 B/s"
+    )
+
+    var diskAvailShift = prevAmbient
+    diskAvailShift.storage.availableBytes -= 256 * 1_048_576
+    try expectEqual(
+        WidgetCardCanvasNSView.isWithinAmbientDeadband(kind: .memoryStorage, prev: prevAmbient, curr: diskAvailShift),
+        false,
+        "memoryStorage widget refreshes when availableBytes shifts >= 64 MB"
+    )
+
+    var wearShift = prevAmbient
+    wearShift.storage.lifeUsedPct = 2
+    try expectEqual(
+        WidgetCardCanvasNSView.isWithinAmbientDeadband(kind: .memoryStorage, prev: prevAmbient, curr: wearShift),
+        false,
+        "memoryStorage widget refreshes when SMART lifeUsedPct increments"
+    )
+
+    // 10–11. Live NSPanel & NSStatusItem window tests (gated on awake WindowServer)
+    if canConnectToAwakeWindowServer() {
+        ensureTestGUIApplication()
+
+        let testPanel = DesktopWidgetPanel(
+            kind: .cpuGpu,
+            initialFrame: CGRect(x: 100, y: 100, width: 320, height: 192),
+            locked: true,
+            themeMode: .darkGraphite,
+            rootView: EmptyView()
+        )
+        let expectedLevel = Int(CGWindowLevelForKey(.desktopIconWindow)) + 1
+        try expectEqual(testPanel.level.rawValue, expectedLevel, "wallpaper-above-icons window level")
+        try expectTrue(
+            testPanel.collectionBehavior.contains([.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]),
+            "panel collectionBehavior includes all 4 desktop stationary flags"
+        )
+        try expectTrue(
+            testPanel.styleMask.contains([.borderless, .nonactivatingPanel]),
+            "panel styleMask is borderless nonactivatingPanel"
+        )
+        try expectEqual(testPanel.ignoresMouseEvents, true, "locked panel clicks through")
+        testPanel.applyLockState(false)
+        try expectEqual(testPanel.ignoresMouseEvents, false, "unlocked panel accepts mouse events for snap-drag")
+        testPanel.close()
+
+        let liveSuiteName = "com.xstation.sensei.livepanel.tests.\(UUID().uuidString)"
+        let liveDefaults = UserDefaults(suiteName: liveSuiteName)!
+        defer { liveDefaults.removePersistentDomain(forName: liveSuiteName) }
+        let liveSettings = SettingsStore(defaults: liveDefaults)
+        let liveManager = DesktopWidgetManager(engine: engine, settings: liveSettings)
+        liveManager.setSizePreset(.wide, for: .cpuGpu)
+        try expectEqual(
+            liveManager.activePanel(for: .cpuGpu)?.frame.size,
+            DesktopWidgetKind.cpuGpu.size(for: .wide),
+            "live panel resizes up to .wide"
+        )
+        liveManager.setSizePreset(.compact, for: .cpuGpu)
+        try expectEqual(
+            liveManager.activePanel(for: .cpuGpu)?.frame.size,
+            DesktopWidgetKind.cpuGpu.size(for: .compact),
+            "live panel shrinks cleanly down to .compact without NSHostingView minSize clamp"
+        )
+        for kind in DesktopWidgetKind.allCases {
+            liveManager.setWidgetEnabled(kind, enabled: false)
+        }
+
+        try expectEqual(engine.currentInterval, 2.0, "engine starts at ambient 2.0s")
+        let statusController = StatusBarController(
+            engine: engine,
+            settings: settings,
+            widgetManager: manager,
+            onOpenConsole: {}
+        )
+        statusController.popoverWillShow(Notification(name: NSPopover.willShowNotification))
+        try expectEqual(engine.currentInterval, 1.0, "popoverWillShow switches engine to 1.0s")
+        statusController.popoverDidClose(Notification(name: NSPopover.didCloseNotification))
+        try expectEqual(engine.currentInterval, 2.0, "popoverDidClose restores engine to 2.0s")
+    } else {
+        print("[SKIP] GUI WindowServer asleep or console not owned by uid")
     }
-
-    // 11. StatusBarController popover interactive session ref-counting
-    try expectEqual(engine.currentInterval, 2.0, "engine starts at ambient 2.0s")
-    let statusController = StatusBarController(
-        engine: engine,
-        settings: settings,
-        widgetManager: manager,
-        onOpenConsole: {}
-    )
-    statusController.popoverWillShow(Notification(name: NSPopover.willShowNotification))
-    try expectEqual(engine.currentInterval, 1.0, "popoverWillShow switches engine to 1.0s")
-    statusController.popoverDidClose(Notification(name: NSPopover.didCloseNotification))
-    try expectEqual(engine.currentInterval, 2.0, "popoverDidClose restores engine to 2.0s")
 }

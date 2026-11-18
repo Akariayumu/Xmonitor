@@ -58,6 +58,10 @@ struct MenuPopoverView: View {
 
                 Spacer(minLength: 4)
 
+                GitHubCornerButton(diameter: 24, iconSize: 12.5) {
+                    onClosePopover()
+                }
+
                 Menu {
                     Section("顶部菜单栏样式") {
                         ForEach(MenuBarLayoutStyle.allCases, id: \.rawValue) { style in

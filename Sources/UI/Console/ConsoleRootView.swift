@@ -480,6 +480,8 @@ struct ConsoleRootView: View {
                 }
                 .buttonStyle(.plain)
                 .help("立即采样刷新")
+
+                GitHubCornerButton(diameter: 26, iconSize: 13.5)
             }
         }
     }
